@@ -20,8 +20,10 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 APP = "SVG Varyant Üretici"
-COL_T = "Şablon"
+COL_T = "Beden"  # her satırın hangi şablon dosyasıyla üretileceğini söyleyen sütun
+COL_T_OLD = "Şablon"
 COL_F = "Dosya Adı"
+SIZE_ALIASES = [("2xl", "xxl"), ("3xl", "xxxl"), ("4xl", "xxxxl"), ("5xl", "xxxxxl"), ("2xs", "xxs"), ("3xs", "xxxs")]
 SKIP = "(yok say)"
 
 CASES = {"asis": "Olduğu gibi", "upper": "BÜYÜK HARF", "lower": "küçük harf", "title": "Baş Harfler Büyük"}
@@ -323,6 +325,12 @@ def build_lookup(templates):
     for k, v in tokens.items():
         if len(v) == 1:
             m.setdefault(k, v[0])
+    # 2XL yazılmışsa XXL.svg'yi (ve tersini) bul.
+    for a, b in SIZE_ALIASES:
+        if a in m:
+            m.setdefault(b, m[a])
+        elif b in m:
+            m.setdefault(a, m[b])
     return m
 
 
@@ -537,9 +545,6 @@ def report_text(rep, out_dir=""):
 # Çekirdek: tablo verisi okuma (yapıştırma, CSV, Excel)
 # ----------------------------------------------------------------------------
 
-DELIMS = {"Otomatik": None, "Sekme (Tab)": "\t", "Noktalı virgül ;": ";", "Virgül ,": ",", "Dikey çizgi |": "|"}
-
-
 def parse_text(text, delim=None):
     lines = [ln for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if ln.strip()]
     if not lines:
@@ -610,6 +615,18 @@ def match_target(header, targets):
     return ""
 
 
+def template_col(rows, lookup):
+    """Şablon adlarıyla en çok eşleşen sütunun sırası; hiç eşleşme yoksa None.
+    Eksik şablonlu satırlar olabileceği için tam eşleşme aranmaz."""
+    if not rows or not lookup:
+        return None
+    ratios = []
+    for j in range(len(rows[0])):
+        vals = [r[j] for r in rows if r[j]]
+        ratios.append(sum(1 for v in vals if norm(v) in lookup) / len(vals) if vals else 0)
+    return ratios.index(max(ratios)) if max(ratios) > 0 else None
+
+
 def guess_mapping(rows, targets, lookup):
     """(başlık var mı, [her sütun için hedef])"""
     if not rows:
@@ -623,15 +640,7 @@ def guess_mapping(rows, targets, lookup):
             seen.add(h)
         return True, out
     mapping = [""] * width
-    tcol = None
-    if lookup:
-        # Şablon adlarıyla en çok eşleşen sütun (eksik şablonlu satırlar olabileceği için tam eşleşme aranmaz).
-        ratios = []
-        for j in range(width):
-            vals = [r[j] for r in rows if r[j]]
-            ratios.append(sum(1 for v in vals if norm(v) in lookup) / len(vals) if vals else 0)
-        if max(ratios) > 0:
-            tcol = ratios.index(max(ratios))
+    tcol = template_col(rows, lookup)
     if tcol is None and width > 1:
         # Şablonla eşleşmese de en az çeşit içeren kısa sütun büyük ihtimalle beden sütunudur.
         best = min(range(width), key=lambda j: len({r[j] for r in rows}))
@@ -694,6 +703,11 @@ def write_xlsx(path, columns, rows, stems, fields):
 # Arayüz
 # ----------------------------------------------------------------------------
 
+def resource_path(rel):
+    """Kaynaktan çalışırken proje klasörü, exe içinde PyInstaller'ın açtığı geçici klasör."""
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / rel
+
+
 def session_path():
     # Taşınabilir exe: ayarlar exe'nin yanında durur (klasör yazılabilirse), yoksa kullanıcı profilinde.
     if getattr(sys, "frozen", False):
@@ -710,36 +724,193 @@ def open_path(p):
         messagebox.showerror(APP, f"Açılamadı:\n{p}\n\n{e}")
 
 
-class ImportDialog(tk.Toplevel):
-    """Yapıştırılan metni veya dosyadan okunan satırları tablo sütunlarına eşler."""
+class BulkDialog(tk.Toplevel):
+    """Toplu giriş: her sütun ayrı bir kutu, kutuda satır başına bir değer.
+    Aynı satır numarasındaki değerler tablonun aynı satırını oluşturur."""
 
-    def __init__(self, app, rows=None, text="", title="Veri içe aktar"):
+    def __init__(self, app, focus_col=None, paste_text=""):
+        super().__init__(app)
+        self.app = app
+        self.title("Toplu giriş")
+        self.transient(app)
+        self.cols = app.data_columns()
+        self.geometry(f"{min(1500, max(760, 110 + 215 * len(self.cols)))}x660")
+        self.texts, self.heads = {}, {}
+        self._driver = None
+        mono = ("Consolas", 11)
+
+        ttk.Label(self, justify="left", foreground="#444", text=(
+            "Her kutu bir sütundur: her satıra bir değer yazın ya da yapıştırın. Aynı numaralı satırlar tek bir "
+            "ürün olur.\nExcel'den birden fazla sütunu birlikte yapıştırırsanız yan kutulara dağıtılır; beden "
+            "sütunu kendiliğinden Beden kutusuna gider.")).pack(anchor="w", padx=10, pady=(10, 6))
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=10)
+        body.rowconfigure(1, weight=1)
+        self.gutter = tk.Text(body, width=4, font=mono, bg="#ececec", fg="#888", relief="flat", takefocus=0,
+                              state="disabled", cursor="arrow")
+        self.gutter.grid(row=1, column=0, sticky="ns")
+        for j, c in enumerate(self.cols, 1):
+            body.columnconfigure(j, weight=1, uniform="col")
+            h = ttk.Label(body, text=c, font=("Segoe UI", 10, "bold"))
+            h.grid(row=0, column=j, sticky="w", padx=3, pady=(0, 3))
+            t = tk.Text(body, width=18, wrap="none", undo=True, font=mono)
+            t.grid(row=1, column=j, sticky="nsew", padx=2)
+            t.insert("1.0", "\n".join(str(r.get(c, "") or "") for r in app.rows))
+            t.edit_reset()
+            t.configure(yscrollcommand=lambda a, b, src=t: self._on_scroll(src, a, b))
+            t.bind("<<Paste>>", lambda e, col=c: self._paste(col))
+            t.bind("<KeyRelease>", lambda e: self._counts())
+            for ev in ("<Enter>", "<FocusIn>", "<Key>", "<MouseWheel>"):
+                t.bind(ev, lambda e, src=t: self._drive(src), add="+")
+            bf = ttk.Frame(body)
+            bf.grid(row=2, column=j, sticky="w", padx=2, pady=(3, 0))
+            ttk.Button(bf, text="Temizle", width=8, command=lambda col=c: self._set(col, [])).pack(side="left")
+            ttk.Button(bf, text="Aşağı doldur", command=lambda col=c: self._fill(col)).pack(side="left", padx=3)
+            self.texts[c], self.heads[c] = t, h
+        self.sb = ttk.Scrollbar(body, orient="vertical", command=self._yview)
+        self.sb.grid(row=1, column=len(self.cols) + 1, sticky="ns")
+
+        bot = ttk.Frame(self)
+        bot.pack(fill="x", padx=10, pady=10)
+        self.info = ttk.Label(bot, text="")
+        self.info.pack(side="left")
+        ttk.Button(bot, text="Vazgeç", command=self.destroy).pack(side="right")
+        ttk.Button(bot, text="Uygula", style="Big.TButton", command=self.apply).pack(side="right", padx=6)
+
+        first = self.texts.get(focus_col) or self.texts[self.cols[1] if len(self.cols) > 2 else self.cols[0]]
+        first.focus_set()
+        first.mark_set("insert", "end")
+        self._driver = first
+        if paste_text.strip():
+            self._paste(focus_col or self.cols[0], paste_text)
+        self._counts()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Control-Return>", lambda e: self.apply())
+        self.grab_set()
+
+    # ---- içerik ----
+    def lines(self, col):
+        out = [ln.strip() for ln in self.texts[col].get("1.0", "end-1c").split("\n")]
+        while out and not out[-1]:
+            out.pop()
+        return out
+
+    def _set(self, col, lines):
+        t = self.texts[col]
+        t.delete("1.0", "end")
+        t.insert("1.0", "\n".join(lines))
+        self._counts()
+
+    def _fill(self, col):
+        """Boş satırları bir üstteki değerle doldurur (en uzun sütunun boyuna kadar)."""
+        n = max(len(self.lines(c)) for c in self.cols)
+        cur = self.lines(col)
+        cur += [""] * (n - len(cur))
+        last = ""
+        for i, v in enumerate(cur):
+            if v:
+                last = v
+            else:
+                cur[i] = last
+        self._set(col, cur)
+
+    def _paste(self, col, clip=None):
+        """Çok sütunlu yapıştırmayı kutulara dağıtır; tek sütunlu yapıştırmayı Tk'ya bırakır."""
+        given = clip is not None
+        if not given:
+            try:
+                clip = self.clipboard_get()
+            except tk.TclError:
+                return "break"
+        delim = "\t" if "\t" in clip else ";" if ";" in clip else None
+        rows = parse_text(clip, delim) if delim else []
+        if not rows or len(rows[0]) < 2:
+            if rows or given:  # tek sütun: tırnak/ayırıcıdan arındırıp sütunun sonuna ekle
+                new = [r[0] for r in rows] if rows else [ln.strip() for ln in clip.splitlines() if ln.strip()]
+                self._set(col, self.lines(col) + new)
+                return "break"
+            self.after_idle(self._counts)
+            return None
+        tcol = template_col(rows, build_lookup(self.app.templates))
+        targets = [c for c in self.cols[self.cols.index(col):] if tcol is None or c != COL_T]
+        plan = {}
+        for k in range(len(rows[0])):
+            if k == tcol:
+                plan[COL_T] = k
+            elif targets:
+                plan[targets.pop(0)] = k
+        base = max(len(self.lines(c)) for c in plan)
+        for c, k in plan.items():
+            cur = self.lines(c)
+            self._set(c, cur + [""] * (base - len(cur)) + [r[k] for r in rows])
+        return "break"
+
+    def _counts(self):
+        counts = {c: len(self.lines(c)) for c in self.cols}
+        n = max(counts.values())
+        for c in self.cols:
+            self.heads[c].config(text=f"{c}  ({counts[c]})")
+        self.gutter.config(state="normal")
+        self.gutter.delete("1.0", "end")
+        self.gutter.insert("1.0", "\n".join(f"{i:>3}" for i in range(1, n + 40)))
+        self.gutter.config(state="disabled")
+        if self._driver is not None:
+            self.gutter.yview(self._driver.index("@0,0"))
+        filled = {v for v in counts.values() if v}
+        if len(filled) > 1:
+            self.info.config(foreground="#b00020", text="Satır sayıları farklı: " + ",  ".join(
+                f"{c} {v}" for c, v in counts.items() if v) + "   (eksik kalanlar boş yazılır)")
+        else:
+            self.info.config(foreground="#444", text=f"{n} satır")
+
+    # ---- birlikte kaydırma ----
+    def _drive(self, src):
+        self._driver = src
+
+    def _on_scroll(self, src, a, b):
+        # Yalnızca kullanıcının kaydırdığı kutu diğerlerini sürükler; kısa kutular uzunları geri çekmesin.
+        if src is not self._driver:
+            return
+        self.sb.set(a, b)
+        top = src.index("@0,0")
+        for t in list(self.texts.values()) + [self.gutter]:
+            if t is not src:
+                t.yview(top)
+
+    def _yview(self, *args):
+        longest = max(self.texts.values(), key=lambda t: int(t.index("end-1c").split(".")[0]))
+        self._driver = longest
+        longest.yview(*args)
+
+    def apply(self):
+        data = {c: self.lines(c) for c in self.cols}
+        n = max(len(v) for v in data.values())
+        rows = []
+        for i in range(n):
+            r = dict(self.app.rows[i]) if i < len(self.app.rows) else {}
+            for c in self.cols:
+                r[c] = data[c][i] if i < len(data[c]) else ""
+            if any(r[c] for c in self.cols):
+                rows.append(r)
+        self.app.rows = rows
+        self.app.refresh_table()
+        self.destroy()
+
+
+class ImportDialog(tk.Toplevel):
+    """Dosyadan okunan satırları tablo sütunlarına eşler."""
+
+    def __init__(self, app, rows, title="Veri içe aktar"):
         super().__init__(app)
         self.app = app
         self.title(title)
-        self.geometry("900x640")
+        self.geometry("900x560")
         self.transient(app)
-        self.paste_mode = rows is None
-        self.raw = rows or []
+        self.raw = rows
         self.combos = []
         self.header = tk.BooleanVar(value=False)
         self.mode = tk.StringVar(value="append")
-        self.delim = tk.StringVar(value="Otomatik")
-
-        if self.paste_mode:
-            f = ttk.LabelFrame(self, text="Satırları buraya yapıştırın veya yazın (her satır bir ürün)")
-            f.pack(fill="both", expand=False, padx=10, pady=(10, 4))
-            self.text = tk.Text(f, height=9, wrap="none", undo=True)
-            self.text.pack(fill="both", expand=True, padx=6, pady=6)
-            self.text.insert("1.0", text)
-            bar = ttk.Frame(f)
-            bar.pack(fill="x", padx=6, pady=(0, 6))
-            ttk.Label(bar, text="Ayırıcı:").pack(side="left")
-            ttk.Combobox(bar, textvariable=self.delim, values=list(DELIMS), state="readonly",
-                         width=18).pack(side="left", padx=6)
-            ttk.Button(bar, text="Ayrıştır / Yenile", command=self.reparse).pack(side="left")
-            ttk.Label(bar, text='Örn:  AYŞE;M   veya   "AYŞE";"M";   veya Excel\'den kopyalanan hücreler',
-                      foreground="#666").pack(side="left", padx=10)
 
         opt = ttk.Frame(self)
         opt.pack(fill="x", padx=10, pady=4)
@@ -766,17 +937,8 @@ class ImportDialog(tk.Toplevel):
         ttk.Button(bot, text="İptal", command=self.destroy).pack(side="right")
         ttk.Button(bot, text="İçe aktar", command=self.do_import).pack(side="right", padx=6)
 
-        if self.paste_mode:
-            if text.strip():
-                self.reparse()
-            self.text.focus_set()
-        else:
-            self.setup_mapping()
-        self.grab_set()
-
-    def reparse(self):
-        self.raw = parse_text(self.text.get("1.0", "end"), DELIMS[self.delim.get()])
         self.setup_mapping()
+        self.grab_set()
 
     def setup_mapping(self):
         for w in self.mapf.winfo_children():
@@ -820,14 +982,6 @@ class ImportDialog(tk.Toplevel):
         self.info.config(text=f"{len(data)} satır")
 
     def do_import(self):
-        if self.paste_mode:
-            fresh = parse_text(self.text.get("1.0", "end"), DELIMS[self.delim.get()])
-            if fresh != self.raw:
-                self.raw = fresh
-                self.setup_mapping()
-                messagebox.showinfo(APP, "Metin değişmişti, yeniden ayrıştırıldı. "
-                                         "Eşleştirmeyi kontrol edip tekrar 'İçe aktar'a basın.", parent=self)
-                return
         chosen = [v.get() for v in self.combos if v.get() != SKIP]
         if not chosen:
             messagebox.showwarning(APP, "En az bir sütunu bir alana eşleştirin.", parent=self)
@@ -848,6 +1002,10 @@ class App(tk.Tk):
     def __init__(self, load_session=True):
         super().__init__()
         self.title(APP)
+        try:
+            self.iconbitmap(default=str(resource_path("assets/app.ico")))
+        except tk.TclError:
+            pass
         self.geometry("1180x760")
         self.minsize(980, 620)
         self.templates = []
@@ -866,7 +1024,7 @@ class App(tk.Tk):
         self.v_tpl = tk.StringVar()
         self.v_out = tk.StringVar()
         self.v_rec = tk.BooleanVar(value=False)
-        self.v_pattern = tk.StringVar(value="{Şablon}_{NAME}")
+        self.v_pattern = tk.StringVar(value="{Beden}_{NAME}")
         self.v_usename = tk.BooleanVar(value=True)
         self.v_sub = tk.BooleanVar(value=False)
         self.v_coll = tk.StringVar(value="overwrite")
@@ -925,7 +1083,7 @@ class App(tk.Tk):
         self.v_tpl.set(d.get("tpl_dir", ""))
         self.v_out.set(d.get("out_dir", ""))
         self.v_rec.set(bool(d.get("recursive")))
-        self.v_pattern.set(d.get("pattern", "{Şablon}_{NAME}"))
+        self.v_pattern.set(d.get("pattern", "{Beden}_{NAME}"))
         self.v_usename.set(d.get("use_name_col", True))
         self.v_sub.set(bool(d.get("subfolder")))
         self.v_coll.set(d.get("collision", "overwrite") if d.get("collision") in COLLISION else "overwrite")
@@ -934,6 +1092,9 @@ class App(tk.Tk):
         self.v_openafter.set(bool(d.get("open_after")))
         self.fields = [dict(new_field(f.get("name", "")), **f) for f in d.get("fields", []) if f.get("name")]
         self.rows = [dict(r) for r in d.get("rows", []) if isinstance(r, dict)]
+        for r in self.rows:  # eski projelerde sütunun adı "Şablon"du
+            if COL_T_OLD in r:
+                r.setdefault(COL_T, r.pop(COL_T_OLD))
         self.project_file = d.get("project_file")
         self.templates = []
         if self.v_tpl.get() and Path(self.v_tpl.get()).is_dir():
@@ -995,7 +1156,8 @@ class App(tk.Tk):
             "    Dosya adı şablonun (bedenin) adıdır.\n\n"
             "2) 'Proje ve Analiz' sekmesinde şablon klasörünü seçip 'Analiz Et'e basın.\n"
             "    Bulunan alanlardan hangilerinin değişken olduğunu işaretleyin.\n\n"
-            "3) 'Veri' sekmesinde tabloyu doldurun: elle, çoklu satır yapıştırarak veya Excel/CSV ile.\n\n"
+            "3) 'Veri' sekmesinde tabloyu doldurun: 'Toplu giriş' ile sütun sütun yapıştırarak,\n"
+            "    elle ya da Excel/CSV yükleyerek.\n\n"
             "4) 'İsimlendirme ve Seçenekler' sekmesinde dosya adı kalıbını ve kuralları belirleyin.\n\n"
             "5) 'Üret' sekmesinde önce 'Kontrol Et', sonra 'ÜRET'."))
 
@@ -1187,7 +1349,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="Seçilenleri sil", command=self.delete_rows).pack(side="left", padx=4)
         ttk.Button(bar, text="Tümünü temizle", command=self.clear_rows).pack(side="left")
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Çoklu satır yapıştır…", command=self.paste_dialog).pack(side="left")
+        ttk.Button(bar, text="Toplu giriş…", style="Big.TButton", command=self.bulk_dialog).pack(side="left")
         ttk.Button(bar, text="Excel / CSV yükle…", command=self.import_file).pack(side="left", padx=4)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="Boş şablon Excel indir…", command=lambda: self.export_xlsx(False)).pack(side="left")
@@ -1205,7 +1367,7 @@ class App(tk.Tk):
         self.tree.tag_configure("bad", foreground="#b00020")
         self.tree.bind("<Double-1>", self._cell_dblclick)
         self.tree.bind("<Delete>", lambda e: self.delete_rows())
-        self.tree.bind("<Control-v>", lambda e: self.paste_dialog(from_clipboard=True))
+        self.tree.bind("<Control-v>", lambda e: self.bulk_dialog(from_clipboard=True))
         self.tree.bind("<Control-a>", lambda e: self.tree.selection_set(self.tree.get_children()))
         self.lbl_rows = ttk.Label(tab, foreground="#555", text="")
         self.lbl_rows.pack(anchor="w", pady=(6, 0))
@@ -1218,7 +1380,10 @@ class App(tk.Tk):
         cols = ["#"] + self.data_columns()
         self.tree["columns"] = cols
         for c in cols:
-            self.tree.heading(c, text=c)
+            if c == "#":
+                self.tree.heading(c, text=c)
+            else:  # başlığa tıklamak o sütunun toplu girişini açar
+                self.tree.heading(c, text=f"{c}   ▤ Toplu", command=lambda col=c: self.bulk_dialog(col))
             self.tree.column(c, width=50 if c == "#" else 170, anchor="center" if c == "#" else "w",
                              stretch=(c != "#"))
         self.tree.delete(*self.tree.get_children())
@@ -1230,7 +1395,8 @@ class App(tk.Tk):
             bad += 0 if ok else 1
             self.tree.insert("", "end", iid=str(i), values=[i + 1] + [r.get(c, "") for c in cols[1:]],
                              tags=() if ok else ("bad",))
-        msg = f"{len(self.rows)} satır.  Hücreyi düzenlemek için çift tıklayın, Tab ile sonraki hücreye geçin."
+        msg = (f"{len(self.rows)} satır.  Hücre için çift tıklayın (Tab: sonraki hücre). "
+               f"Bir sütunu topluca doldurmak için başlığına tıklayın.")
         if bad:
             msg += f"   Kırmızı {bad} satırın şablonu klasörde yok."
         self.lbl_rows.config(text=msg)
@@ -1312,14 +1478,15 @@ class App(tk.Tk):
         ed.bind("<Escape>", lambda e: self._close_editor())
         ed.bind("<FocusOut>", lambda e: commit())
 
-    def paste_dialog(self, from_clipboard=False):
+    def bulk_dialog(self, focus_col=None, from_clipboard=False):
+        self._close_editor()
         text = ""
         if from_clipboard:
             try:
                 text = self.clipboard_get()
             except tk.TclError:
                 text = ""
-        ImportDialog(self, None, text, "Çoklu satır yapıştır")
+        return BulkDialog(self, focus_col, text)
 
     def import_file(self):
         p = filedialog.askopenfilename(title="Veri dosyası seç", filetypes=[
@@ -1337,7 +1504,7 @@ class App(tk.Tk):
         if not rows:
             messagebox.showinfo(APP, "Dosyada veri bulunamadı.")
             return
-        ImportDialog(self, rows, "", f"İçe aktar – {Path(p).name}")
+        ImportDialog(self, rows, f"İçe aktar – {Path(p).name}")
 
     def export_xlsx(self, with_rows):
         name = "veri.xlsx" if with_rows else "veri-sablonu.xlsx"
@@ -1375,7 +1542,7 @@ class App(tk.Tk):
         self.lbl_preview = ttk.Label(g, text="", foreground="#0b5394", font=("Consolas", 10))
         self.lbl_preview.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=(6, 0))
         ttk.Label(g, foreground="#555", text=(
-            "{sıra:03} → 001, 002…   Kalıpta / kullanırsanız alt klasör oluşur (örn. {Şablon}/{NAME}).")
+            "{sıra:03} → 001, 002…   Kalıpta / kullanırsanız alt klasör oluşur (örn. {Beden}/{NAME}).")
                   ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Checkbutton(g, text=f"Tablodaki '{COL_F}' sütunu doluysa kalıp yerine onu kullan",
                         variable=self.v_usename, command=self.update_name_preview).grid(

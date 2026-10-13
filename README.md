@@ -1,3 +1,5 @@
+<img src="assets/logo.png" width="96" align="right" alt="logo">
+
 # SVG Varyant Üretici
 
 Şablon SVG dosyalarındaki isimlendirilmiş yazı katmanlarını bir tablodaki verilerle doldurup her satır için ayrı SVG üreten Windows masaüstü programı. Forma, tişört, yaka kartı gibi isim/numara baskılı işlerde tek tek elle yazmak yerine kullanılır.
@@ -18,9 +20,10 @@
 ## Özellikler
 
 - **Analiz:** Klasördeki SVG'leri tarar, isimli yazı katmanlarını ve hangi şablonda eksik olduklarını gösterir. Bir üründe birden fazla değişken alan olabilir (isim, numara, kan grubu…).
-- **Veri girişi:** Düzenlenebilir tablo, çoklu satır yapıştırma (Excel hücreleri, `;` `,` sekme ayrımlı metin), Excel/CSV/TXT içe aktarma, otomatik sütun eşleştirme.
+- **Toplu giriş:** Beden sütunu ve şablonda bulunan her alan ayrı bir kutudur; her kutuya satır başına bir değer yazılır ya da yapıştırılır. Excel'den birlikte kopyalanan sütunlar kutulara dağıtılır. Tablodaki sütun başlığına tıklamak o sütunun toplu girişini açar.
+- **Veri girişi:** Düzenlenebilir tablo, Excel/CSV/TXT içe aktarma, otomatik sütun eşleştirme. `2XL` yazılan beden `XXL.svg` şablonunu (ve tersini) bulur.
 - **Excel:** Boş veri şablonu indirme, tabloyu Excel'e aktarma.
-- **Dosya adı:** `{Şablon}_{NAME}`, `{sıra:03}`, `{tarih}` gibi kalıplar; kalıpta `/` ile alt klasör; isteğe bağlı olarak tablodaki "Dosya Adı" sütunundan.
+- **Dosya adı:** `{Beden}_{NAME}`, `{sıra:03}`, `{tarih}` gibi kalıplar; kalıpta `/` ile alt klasör; isteğe bağlı olarak tablodaki "Dosya Adı" sütunundan.
 - **Alan ayarları:** Harf dönüşümü (Türkçe İ/ı uyumlu), önek/sonek, boş değer davranışı.
 - **Font küçültme:** Yazı belirlenen karakter sayısını aşarsa font boyutu orantılı küçültülür, alt sınır yüzdesiyle.
 - **Güvenlik:** Orijinal şablonları koruma, mevcut dosyalar için üzerine yaz / atla / numara ekle.
