@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -23,6 +24,7 @@ APP = "SVG Varyant Üretici"
 COL_T = "Beden"  # her satırın hangi şablon dosyasıyla üretileceğini söyleyen sütun
 COL_T_OLD = "Şablon"
 COL_F = "Dosya Adı"
+CHECK_DIR = "KONTROL-EDILECEK"  # elle bakılması gereken çıktıların ayrıldığı alt klasör
 SIZE_ALIASES = [("2xl", "xxl"), ("3xl", "xxxl"), ("4xl", "xxxxl"), ("5xl", "xxxxxl"), ("2xs", "xxs"), ("3xs", "xxxs")]
 SKIP = "(yok say)"
 
@@ -120,23 +122,28 @@ def parse_css(src):
     return css
 
 
-def find_font_size(attrs, css):
-    """(değer, birim) döndürür; bulunamazsa None."""
+def css_values(attrs, css, prop):
+    """Bir öğenin style özelliği, sunum özelliği ve sınıflarından prop değerleri (öncelik sırasıyla)."""
     cands = []
     sm = STYLE_ATTR_RE.search(attrs)
     if sm:
         for d in sm.group(2).split(";"):
             k, _, v = d.partition(":")
-            if k.strip().lower() == "font-size":
+            if k.strip().lower() == prop:
                 cands.append(v)
-    a = get_attr(attrs, "font-size")
+    a = get_attr(attrs, prop)
     if a:
         cands.append(a)
     for c in (get_attr(attrs, "class") or "").split():
-        v = css.get(c, {}).get("font-size")
+        v = css.get(c, {}).get(prop)
         if v:
             cands.append(v)
-    for c in cands:
+    return cands
+
+
+def find_font_size(attrs, css):
+    """(değer, birim) döndürür; bulunamazsa None."""
+    for c in css_values(attrs, css, "font-size"):
         m = SIZE_RE.match(c)
         if m:
             try:
@@ -144,6 +151,141 @@ def find_font_size(attrs, css):
             except ValueError:
                 pass
     return None
+
+
+# ----------------------------------------------------------------------------
+# Çekirdek: font karakter desteği (yazıdaki harfler fontta var mı?)
+# ----------------------------------------------------------------------------
+
+TR_CHARS = "çÇğĞıİöÖşŞüÜ"
+FONT_MAGIC = (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf")
+_font_index = None
+_cmap_cache = {}
+
+
+def font_dirs():
+    env = os.environ
+    return [
+        (Path(env.get("WINDIR", r"C:\Windows")) / "Fonts", False),
+        (Path(env.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts", False),
+        # Adobe Fonts ile eşitlenen fontlar uzantısız, gizli dosyalardır.
+        (Path(env.get("APPDATA", "")) / "Adobe" / "CoreSync" / "plugins" / "livetype", True),
+        (Path(env.get("CommonProgramFiles", "")) / "Adobe" / "Fonts", True),
+    ]
+
+
+def _face_offsets(f):
+    f.seek(0)
+    head = f.read(12)
+    if head[:4] not in FONT_MAGIC:
+        return []
+    if head[:4] == b"ttcf":
+        n = struct.unpack(">I", head[8:12])[0]
+        return list(struct.unpack(f">{n}I", f.read(4 * n)))
+    return [0]
+
+
+def _tables(f, off):
+    f.seek(off + 4)
+    n = struct.unpack(">H", f.read(2))[0]
+    f.seek(off + 12)
+    raw = f.read(16 * n)
+    return {raw[i:i + 4]: struct.unpack(">II", raw[i + 8:i + 16]) for i in range(0, 16 * n, 16)}
+
+
+def _font_names(f, off):
+    tab = _tables(f, off).get(b"name")
+    if not tab:
+        return set()
+    f.seek(tab[0])
+    data = f.read(tab[1])
+    count, so = struct.unpack(">HH", data[2:6])
+    out = set()
+    for i in range(count):
+        pid, _eid, _lid, nid, ln, no = struct.unpack(">6H", data[6 + 12 * i:18 + 12 * i])
+        if nid in (1, 4, 6, 16):  # aile, tam ad, PostScript adı, tipografik aile
+            raw = data[so + no:so + no + ln]
+            try:
+                out.add(raw.decode("utf-16-be" if pid in (0, 3) else "mac_roman"))
+            except UnicodeDecodeError:
+                pass
+    return out
+
+
+def font_index():
+    """Kurulu fontlar: {ad anahtarı: (dosya, yüz konumu)}. İlk çağrıda taranır."""
+    global _font_index
+    if _font_index is not None:
+        return _font_index
+    idx = {}
+    for folder, any_ext in font_dirs():
+        try:
+            files = list(folder.rglob("*")) if any_ext else list(folder.glob("*"))
+        except OSError:
+            continue
+        for p in files:
+            if not any_ext and p.suffix.lower() not in (".ttf", ".otf", ".ttc", ".otc"):
+                continue
+            try:
+                with open(p, "rb") as f:
+                    for off in _face_offsets(f):
+                        for name in _font_names(f, off):
+                            idx.setdefault(norm(name), (p, off))
+            except (OSError, struct.error, IndexError):
+                continue
+    _font_index = idx
+    return idx
+
+
+def font_ranges(path, off):
+    """Fontun desteklediği kod noktası aralıkları [(ilk, son)]."""
+    key = (str(path), off)
+    if key in _cmap_cache:
+        return _cmap_cache[key]
+    ranges = []
+    try:
+        with open(path, "rb") as f:
+            tab = _tables(f, off).get(b"cmap")
+            f.seek(tab[0])
+            data = f.read(tab[1])
+        best = None
+        for i in range(struct.unpack(">H", data[2:4])[0]):
+            pid, eid, so = struct.unpack(">HHI", data[4 + 8 * i:12 + 8 * i])
+            fmt = struct.unpack(">H", data[so:so + 2])[0]
+            if fmt in (4, 12) and (pid == 0 or (pid == 3 and eid in (1, 10))):
+                if best is None or fmt > best[0]:
+                    best = (fmt, so)
+        if best and best[0] == 12:
+            so = best[1]
+            for g in range(struct.unpack(">I", data[so + 12:so + 16])[0]):
+                a, b = struct.unpack(">II", data[so + 16 + 12 * g:so + 24 + 12 * g])
+                ranges.append((a, b))
+        elif best:
+            so = best[1]
+            seg = struct.unpack(">H", data[so + 6:so + 8])[0] // 2
+            ends = struct.unpack(f">{seg}H", data[so + 14:so + 14 + 2 * seg])
+            starts = struct.unpack(f">{seg}H", data[so + 16 + 2 * seg:so + 16 + 4 * seg])
+            ranges = [(a, b) for a, b in zip(starts, ends) if a != 0xFFFF]
+    except (OSError, struct.error, IndexError, TypeError):
+        ranges = []
+    _cmap_cache[key] = ranges
+    return ranges
+
+
+def font_missing(family_css, text):
+    """Yazının fontta olmayan karakterleri. (durum, eksikler, font adı)
+    durum: 'ok' | 'missing' | 'nofont' (font bu bilgisayarda yok, denetlenemedi)."""
+    names = [x.strip().strip("\"'") for x in (family_css or "").split(",") if x.strip()]
+    shown = names[-1] if names else "?"
+    hit = next((font_index()[norm(n)] for n in names if norm(n) in font_index()), None)
+    ranges = font_ranges(*hit) if hit else []
+    if not ranges:
+        return "nofont", [], shown
+    missing = []
+    for ch in dict.fromkeys(text):
+        if not ch.isspace() and not any(a <= ord(ch) <= b for a, b in ranges):
+            missing.append(ch)
+    return ("missing" if missing else "ok"), missing, shown
 
 
 def set_style(tag, prop, val):
@@ -238,14 +380,16 @@ class Template:
             inner = self.src[n["open_end"]:n["inner_end"]]
             tm = TSPAN_RE.search(inner)
             size = (find_font_size(tm.group(0), self.css) if tm else None) or find_font_size(n["attrs"], self.css)
-            n.update(own=own, stripped=stripped,
+            fam = (css_values(tm.group(0), self.css, "font-family") if tm else []) \
+                or css_values(n["attrs"], self.css, "font-family")
+            n.update(own=own, stripped=stripped, family=fam[0] if fam else "",
                      sample=html.unescape(re.sub(r"<[^>]+>", "", inner)).strip(),
                      size=(fmt_num(size[0]) + size[1]) if size else "")
             self.fields.setdefault(field, []).append(n)
 
     def render(self, values, cfgs):
-        """values: {alan: yazı}. (bytes, notlar) döndürür."""
-        edits, notes = [], []
+        """values: {alan: yazı}. (bytes, küçültme notları, elle kontrol gerektiren nedenler) döndürür."""
+        edits, notes, checks = [], [], []
         for fname, nodes in self.fields.items():
             if fname not in values:
                 continue
@@ -266,7 +410,16 @@ class Template:
                 ts_tag = tm.group(0) if tm else None
                 if ts_tag and ts_tag.endswith("/>"):
                     ts_tag = ts_tag[:-2].rstrip() + ">"
+                if val:
+                    state, miss, shown = font_missing(n["family"], val)
+                    if state == "missing":
+                        checks.append(f"{fname}: '{shown}' fontunda olmayan karakter: {' '.join(miss)}")
+                    elif state == "nofont" and any(ord(ch) > 127 for ch in val):
+                        checks.append(f"{fname}: '{shown}' fontu bu bilgisayarda bulunamadı, "
+                                      f"özel karakterler denetlenemedi: "
+                                      f"{' '.join(dict.fromkeys(ch for ch in val if ord(ch) > 127))}")
                 if mx > 0 and len(val) > mx:
+                    checks.append(f"{fname}: uzun yazı ({len(val)} karakter, sınır {mx})")
                     base = find_font_size(ts_tag, self.css) if ts_tag else None
                     on_tspan = base is not None
                     if base is None:
@@ -292,7 +445,7 @@ class Template:
         out = self.src
         for s, e, rep in sorted(edits, reverse=True):
             out = out[:s] + rep + out[e:]
-        return out.encode(self.enc), notes
+        return out.encode(self.enc), notes, list(dict.fromkeys(checks))
 
 
 def analyze(folder, recursive=False, exclude=None):
@@ -309,7 +462,12 @@ def summarize(templates):
     info = {}
     for t in templates:
         for name, nodes in t.fields.items():
-            d = info.setdefault(name, {"files": [], "sample": "", "size": "", "auto": False})
+            d = info.setdefault(name, {"files": [], "sample": "", "size": "", "auto": False, "tr": ""})
+            if not d["tr"]:
+                state, miss, shown = font_missing(nodes[0]["family"], TR_CHARS)
+                d["tr"] = "font bilgisi yok" if not nodes[0]["family"] else {
+                    "ok": f"var ({shown})", "missing": f"EKSİK: {''.join(miss)} ({shown})",
+                    "nofont": f"font kurulu değil ({shown})"}[state]
             d["files"].append(t.stem)
             d["sample"] = d["sample"] or nodes[0]["sample"]
             d["size"] = d["size"] or nodes[0]["size"]
@@ -402,6 +560,7 @@ def row_label(row, active, idx):
 
 def generate(opts, templates, fields, rows, dry=False, progress=None):
     rep = {"done": [], "missing": [], "skipped": [], "warn": [], "shrink": [], "errors": [], "dry": dry,
+           "check": [], "check_dir": bool(opts.get("check_dir")),
            "total": 0}
     lookup = build_lookup(templates)
     tpl_paths = {str(t.path.resolve()).lower() for t in templates}
@@ -438,7 +597,7 @@ def generate(opts, templates, fields, rows, dry=False, progress=None):
                 rep["warn"].append(f"Satır {i} ({label}): {nm} boş yazıldı.")
             values[nm] = val
         try:
-            data, notes = t.render(values, cfgs)
+            data, notes, checks = t.render(values, cfgs)
         except Exception as e:  # tek bir bozuk şablon tüm işi durdurmasın
             rep["errors"].append(f"Satır {i} ({label}): şablon işlenemedi: {e}")
             continue
@@ -457,6 +616,8 @@ def generate(opts, templates, fields, rows, dry=False, progress=None):
             parts = [f"satir_{i}"]
         if opts.get("subfolder"):
             parts = [clean_part(t.stem)] + parts
+        if checks and opts.get("check_dir"):
+            parts = [CHECK_DIR] + parts
         folder = out.joinpath(*parts[:-1])
         stem = parts[-1]
         target = folder / (stem + ".svg")
@@ -492,6 +653,8 @@ def generate(opts, templates, fields, rows, dry=False, progress=None):
                 rep["errors"].append(f"Satır {i} ({label}): yazılamadı: {e}")
                 continue
         rep["done"].append((i, t.stem, label, str(target)))
+        if checks:
+            rep["check"].append((i, label, str(target), checks))
     return rep
 
 
@@ -504,8 +667,16 @@ def report_text(rep, out_dir=""):
     L.append("")
     verb = "Üretilecek" if rep["dry"] else "Üretilen"
     L.append(f"Toplam satır: {rep['total']}   {verb}: {len(rep['done'])}   "
-             f"Şablonu eksik: {len(rep['missing'])}   Atlanan: {len(rep['skipped'])}   Hata: {len(rep['errors'])}")
+             f"Şablonu eksik: {len(rep['missing'])}   Atlanan: {len(rep['skipped'])}   Hata: {len(rep['errors'])}"
+             f"   Kontrol gerekli: {len(rep['check'])}")
     L.append("")
+    if rep["check"]:
+        where = (f"'{CHECK_DIR}' klasörüne ayrıldı" if rep["check_dir"] else "diğerleriyle aynı klasörde")
+        L.append(f"ELLE KONTROL EDİLMESİ GEREKENLER ({len(rep['check'])} dosya, {where})")
+        for i, label, p, reasons in rep["check"]:
+            L.append(f"  Satır {i} ({label}) → {Path(p).name}")
+            L += ["      " + r for r in reasons]
+        L.append("")
     if rep["missing"]:
         L.append("ŞABLONU EKSİK OLANLAR (üretilemedi)")
         groups = {}
@@ -1031,6 +1202,7 @@ class App(tk.Tk):
         self.v_protect = tk.BooleanVar(value=True)
         self.v_savereport = tk.BooleanVar(value=True)
         self.v_openafter = tk.BooleanVar(value=False)
+        self.v_checkdir = tk.BooleanVar(value=True)
 
         self._menu()
         self.nb = ttk.Notebook(self)
@@ -1077,6 +1249,7 @@ class App(tk.Tk):
                 "use_name_col": self.v_usename.get(), "subfolder": self.v_sub.get(),
                 "collision": self.v_coll.get(), "protect": self.v_protect.get(),
                 "save_report": self.v_savereport.get(), "open_after": self.v_openafter.get(),
+                "check_dir": self.v_checkdir.get(),
                 "fields": self.fields, "rows": self.rows, "project_file": self.project_file}
 
     def load_project_dict(self, d):
@@ -1090,6 +1263,7 @@ class App(tk.Tk):
         self.v_protect.set(d.get("protect", True))
         self.v_savereport.set(d.get("save_report", True))
         self.v_openafter.set(bool(d.get("open_after")))
+        self.v_checkdir.set(d.get("check_dir", True))
         self.fields = [dict(new_field(f.get("name", "")), **f) for f in d.get("fields", []) if f.get("name")]
         self.rows = [dict(r) for r in d.get("rows", []) if isinstance(r, dict)]
         for r in self.rows:  # eski projelerde sütunun adı "Şablon"du
@@ -1186,10 +1360,11 @@ class App(tk.Tk):
         f = ttk.LabelFrame(tab, text="Bulunan alanlar (değişken olacakları 'Kullan' sütununa tıklayarak işaretleyin)",
                            padding=8)
         f.pack(fill="both", expand=True, pady=(10, 0))
-        cols = ("use", "name", "files", "miss", "sample", "size", "case", "max", "minpct", "empty", "prefix", "suffix")
+        cols = ("use", "name", "files", "miss", "sample", "size", "tr", "case", "max", "minpct", "empty",
+                "prefix", "suffix")
         heads = ("Kullan", "Alan", "Bulunduğu şablonlar", "Eksik olduğu şablonlar", "Örnek yazı", "Font",
-                 "Harf", "Maks. karakter", "Min. font %", "Boşsa", "Önek", "Sonek")
-        widths = (55, 120, 170, 150, 110, 80, 110, 95, 80, 150, 60, 60)
+                 "Fontta Türkçe harf", "Harf", "Maks. karakter", "Min. font %", "Boşsa", "Önek", "Sonek")
+        widths = (55, 110, 140, 130, 100, 75, 190, 105, 95, 80, 140, 55, 55)
         self.ftree = ttk.Treeview(f, columns=cols, show="headings", height=7, selectmode="browse")
         for c, h, w in zip(cols, heads, widths):
             self.ftree.heading(c, text=h)
@@ -1274,11 +1449,11 @@ class App(tk.Tk):
                                      "SVG'yi yeniden kaydedin.")
 
     def _field_row(self, f):
-        info = getattr(self, "field_info", {}).get(f["name"], {"files": [], "sample": "", "size": ""})
+        info = getattr(self, "field_info", {}).get(f["name"], {"files": [], "sample": "", "size": "", "tr": ""})
         stems = [t.stem for t in self.templates]
         miss = [s for s in stems if s not in info["files"]]
         return ("☑" if f["use"] else "☐", f["name"], ", ".join(info["files"]), ", ".join(miss) or "–",
-                info["sample"], info["size"], CASES.get(f["case"], ""), f["max"] or "kapalı", f["minpct"],
+                info["sample"], info["size"], info["tr"], CASES.get(f["case"], ""), f["max"] or "kapalı", f["minpct"],
                 EMPTY.get(f["empty"], ""), f["prefix"], f["suffix"])
 
     def refresh_fields(self):
@@ -1346,6 +1521,7 @@ class App(tk.Tk):
         bar = ttk.Frame(tab)
         bar.pack(fill="x")
         ttk.Button(bar, text="+ Satır ekle", command=self.add_row).pack(side="left")
+        ttk.Button(bar, text="+ 10 satır", command=lambda: self.add_row(10)).pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="Seçilenleri sil", command=self.delete_rows).pack(side="left", padx=4)
         ttk.Button(bar, text="Tümünü temizle", command=self.clear_rows).pack(side="left")
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
@@ -1402,10 +1578,11 @@ class App(tk.Tk):
         self.lbl_rows.config(text=msg)
         self.update_name_preview()
 
-    def add_row(self):
-        self.rows.append({})
+    def add_row(self, count=1):
+        self.rows.extend({} for _ in range(count))
         self.refresh_table()
-        iid = str(len(self.rows) - 1)
+        self.tree.see(str(len(self.rows) - 1))
+        iid = str(len(self.rows) - count)
         self.tree.see(iid)
         self.tree.selection_set(iid)
         self.after(50, lambda: self._start_edit(iid, 1))
@@ -1607,6 +1784,9 @@ class App(tk.Tk):
         ttk.Button(bar, text="ÜRET", style="Big.TButton", command=lambda: self.run(False)).pack(side="left", padx=6)
         ttk.Button(bar, text="Çıktı klasörünü aç", command=lambda: self.open_dir(self.v_out)).pack(side="right")
         ttk.Button(bar, text="Raporu kaydet…", command=self.save_report).pack(side="right", padx=6)
+        ttk.Checkbutton(tab, variable=self.v_checkdir, text=(
+            f"Elle kontrol gerekenleri ayrı klasöre koymayı sor ({CHECK_DIR}): fontta olmayan harf "
+            f"(ör. Türkçe karakter) veya karakter sınırını aşan yazı")).pack(anchor="w", pady=(8, 0))
         self.prog = ttk.Progressbar(tab, mode="determinate")
         self.prog.pack(fill="x", pady=8)
         f = ttk.Frame(tab)
@@ -1672,11 +1852,27 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror(APP, f"Şablonlar okunamadı:\n{e}")
             return
-        rep = generate(self.options(), self.templates, self.fields, self.rows, dry=dry, progress=progress)
+        opts = dict(self.options(), check_dir=False)
+        if self.v_checkdir.get():
+            # Önce yazmadan dene: kontrol gereken dosya varsa nereye konacağını sor.
+            flagged = generate(opts, self.templates, self.fields, self.rows, dry=True)["check"]
+            if flagged and dry:
+                opts["check_dir"] = True
+            elif flagged:
+                names = ", ".join(label for _, label, _, _ in flagged[:8]) + ("…" if len(flagged) > 8 else "")
+                ans = messagebox.askyesnocancel(APP, (
+                    f"{len(flagged)} dosyanın elle kontrol edilmesi gerekiyor (fontta olmayan harf veya uzun "
+                    f"yazı):\n\n{names}\n\nBunlar '{CHECK_DIR}' adlı ayrı klasöre konsun mu?\n\n"
+                    f"Evet: ayrı klasöre.   Hayır: diğerleriyle aynı yere.   İptal: üretme."))
+                if ans is None:
+                    return
+                opts["check_dir"] = ans
+        rep = generate(opts, self.templates, self.fields, self.rows, dry=dry, progress=progress)
         self.last_report = report_text(rep, out)
         self.set_log(self.last_report)
         self.status.config(text=("Kontrol tamam: " if dry else "Üretim tamam: ") +
-                                f"{len(rep['done'])} dosya, {len(rep['missing'])} eksik şablon")
+                                f"{len(rep['done'])} dosya, {len(rep['missing'])} eksik şablon, "
+                                f"{len(rep['check'])} kontrol gerekli")
         if dry:
             return
         if self.v_savereport.get() and rep["done"]:

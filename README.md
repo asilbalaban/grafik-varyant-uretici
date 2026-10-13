@@ -26,6 +26,7 @@
 - **Dosya adı:** `{Beden}_{NAME}`, `{sıra:03}`, `{tarih}` gibi kalıplar; kalıpta `/` ile alt klasör; isteğe bağlı olarak tablodaki "Dosya Adı" sütunundan.
 - **Alan ayarları:** Harf dönüşümü (Türkçe İ/ı uyumlu), önek/sonek, boş değer davranışı.
 - **Font küçültme:** Yazı belirlenen karakter sayısını aşarsa font boyutu orantılı küçültülür, alt sınır yüzdesiyle.
+- **Font denetimi:** Şablondaki fontu bilgisayarda bulup yazıdaki her harfin fontta olup olmadığına bakar (ör. Türkçe İ, Ğ, Ş). Analiz tablosunda fontun Türkçe desteği görünür. Harfi eksik ya da karakter sınırını aşan çıktılar üretimde sorularak `KONTROL-EDILECEK` klasörüne ayrılır.
 - **Güvenlik:** Orijinal şablonları koruma, mevcut dosyalar için üzerine yaz / atla / numara ekle.
 - **Rapor:** Şablonu eksik satırlar, küçültülen fontlar, boş alanlar ve üretilen dosyalar.
 - **Proje dosyası:** Tüm ayarlar ve tablo `.svgproje` olarak kaydedilir.
