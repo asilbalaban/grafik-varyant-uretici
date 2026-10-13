@@ -25,6 +25,8 @@
 - **Excel:** Boş veri şablonu indirme, tabloyu Excel'e aktarma.
 - **Dosya adı:** `{Beden}_{NAME}`, `{sıra:03}`, `{tarih}` gibi kalıplar; kalıpta `/` ile alt klasör; isteğe bağlı olarak tablodaki "Dosya Adı" sütunundan.
 - **Alan ayarları:** Harf dönüşümü (Türkçe İ/ı uyumlu), önek/sonek, boş değer davranışı.
+- **Hizalama:** Illustrator ortalı yazıyı SVG'ye sol başlangıç noktasıyla kaydeder. Alan "Ortalı" ya da "Sağa yaslı" seçilirse yeni yazı, şablondaki örnek yazının fonttan ölçülen ortasına/sağ kenarına göre yerleşir; böylece isim ve numara birbirine ortalı kalır.
+- **Kodlama:** `iso-8859-1` gibi Türkçe harfleri içermeyen kodlamayla kaydedilmiş şablonlarda ı, ş, ğ, İ sayısal karakter başvurusu olarak yazılır.
 - **Font küçültme:** Yazı belirlenen karakter sayısını aşarsa font boyutu orantılı küçültülür, alt sınır yüzdesiyle.
 - **Font denetimi:** Şablondaki fontu bilgisayarda bulup yazıdaki her harfin fontta olup olmadığına bakar (ör. Türkçe İ, Ğ, Ş). Analiz tablosunda fontun Türkçe desteği görünür. Harfi eksik ya da karakter sınırını aşan çıktılar üretimde sorularak `KONTROL-EDILECEK` klasörüne ayrılır.
 - **Güvenlik:** Orijinal şablonları koruma, mevcut dosyalar için üzerine yaz / atla / numara ekle.

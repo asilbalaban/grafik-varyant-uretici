@@ -30,6 +30,7 @@ SKIP = "(yok say)"
 
 CASES = {"asis": "Olduğu gibi", "upper": "BÜYÜK HARF", "lower": "küçük harf", "title": "Baş Harfler Büyük"}
 EMPTY = {"blank": "Boş bırak", "keep": "Şablondaki yazı kalsın"}
+ALIGN = {"left": "Sola yaslı", "center": "Ortalı", "right": "Sağa yaslı"}
 COLLISION = {"overwrite": "Üzerine yaz", "skip": "Atla (mevcut dosya kalsın)", "number": "Numara ekle (_2, _3…)"}
 
 ALIAS_T = ["şablon", "beden", "size", "kalıp", "template", "varyant", "model"]
@@ -237,55 +238,123 @@ def font_index():
     return idx
 
 
-def font_ranges(path, off):
-    """Fontun desteklediği kod noktası aralıkları [(ilk, son)]."""
-    key = (str(path), off)
-    if key in _cmap_cache:
-        return _cmap_cache[key]
-    ranges = []
-    try:
+class FontFace:
+    """Bir font yüzünün harf → glif eşlemesi ve glif genişlikleri (yalnızca gereken tablolar okunur)."""
+
+    def __init__(self, path, off):
         with open(path, "rb") as f:
-            tab = _tables(f, off).get(b"cmap")
-            f.seek(tab[0])
-            data = f.read(tab[1])
+            tabs = _tables(f, off)
+
+            def table(tag):
+                if tag not in tabs:
+                    return b""
+                f.seek(tabs[tag][0])
+                return f.read(tabs[tag][1])
+
+            cmap, head, hhea, self.hmtx = table(b"cmap"), table(b"head"), table(b"hhea"), table(b"hmtx")
+        self.upm = struct.unpack(">H", head[18:20])[0] or 1000
+        self.nhm = struct.unpack(">H", hhea[34:36])[0]
         best = None
-        for i in range(struct.unpack(">H", data[2:4])[0]):
-            pid, eid, so = struct.unpack(">HHI", data[4 + 8 * i:12 + 8 * i])
-            fmt = struct.unpack(">H", data[so:so + 2])[0]
+        for i in range(struct.unpack(">H", cmap[2:4])[0]):
+            pid, eid, so = struct.unpack(">HHI", cmap[4 + 8 * i:12 + 8 * i])
+            fmt = struct.unpack(">H", cmap[so:so + 2])[0]
             if fmt in (4, 12) and (pid == 0 or (pid == 3 and eid in (1, 10))):
                 if best is None or fmt > best[0]:
                     best = (fmt, so)
-        if best and best[0] == 12:
-            so = best[1]
-            for g in range(struct.unpack(">I", data[so + 12:so + 16])[0]):
-                a, b = struct.unpack(">II", data[so + 16 + 12 * g:so + 24 + 12 * g])
-                ranges.append((a, b))
-        elif best:
-            so = best[1]
-            seg = struct.unpack(">H", data[so + 6:so + 8])[0] // 2
-            ends = struct.unpack(f">{seg}H", data[so + 14:so + 14 + 2 * seg])
-            starts = struct.unpack(f">{seg}H", data[so + 16 + 2 * seg:so + 16 + 4 * seg])
-            ranges = [(a, b) for a, b in zip(starts, ends) if a != 0xFFFF]
-    except (OSError, struct.error, IndexError, TypeError):
-        ranges = []
-    _cmap_cache[key] = ranges
-    return ranges
+        if best is None:
+            raise ValueError("desteklenen cmap tablosu yok")
+        self.fmt, self.sub = best[0], cmap[best[1]:]
+        self._glyphs = {}
+
+    def _u16(self, pos):
+        return struct.unpack(">H", self.sub[pos:pos + 2])[0]
+
+    def glyph(self, cp):
+        """Kod noktasının glif numarası; fontta yoksa 0."""
+        if cp not in self._glyphs:
+            try:
+                self._glyphs[cp] = self._lookup(cp)
+            except struct.error:
+                self._glyphs[cp] = 0
+        return self._glyphs[cp]
+
+    def _lookup(self, cp):
+        s = self.sub
+        if self.fmt == 12:
+            for g in range(struct.unpack(">I", s[12:16])[0]):
+                a, b, gid = struct.unpack(">III", s[16 + 12 * g:28 + 12 * g])
+                if cp < a:
+                    return 0
+                if cp <= b:
+                    return gid + cp - a
+            return 0
+        if cp > 0xFFFF:
+            return 0
+        seg = self._u16(6) // 2
+        for i in range(seg):
+            if cp <= self._u16(14 + 2 * i):
+                start = self._u16(16 + 2 * seg + 2 * i)
+                if cp < start:
+                    return 0
+                delta = self._u16(16 + 4 * seg + 2 * i)
+                ro_pos = 16 + 6 * seg + 2 * i
+                ro = self._u16(ro_pos)
+                if ro == 0:
+                    return (cp + delta) & 0xFFFF
+                gid = self._u16(ro_pos + ro + 2 * (cp - start))
+                return (gid + delta) & 0xFFFF if gid else 0
+        return 0
+
+    def width(self, text, size):
+        """Yazının yaklaşık genişliği (harf aralığı ayarı/kerning hesaba katılmaz)."""
+        total = 0
+        for ch in text:
+            i = min(self.glyph(ord(ch)), self.nhm - 1)
+            total += struct.unpack(">H", self.hmtx[4 * i:4 * i + 2])[0]
+        return total * size / self.upm
+
+
+def find_face(family_css):
+    """CSS font-family değerinden kurulu fontu bulur. (FontFace | None, gösterilecek ad)"""
+    names = [x.strip().strip("\"'") for x in (family_css or "").split(",") if x.strip()]
+    shown = names[-1] if names else "?"
+    hit = next((font_index()[norm(n)] for n in names if norm(n) in font_index()), None)
+    if hit is None:
+        return None, shown
+    key = (str(hit[0]), hit[1])
+    if key not in _cmap_cache:
+        try:
+            _cmap_cache[key] = FontFace(*hit)
+        except (OSError, struct.error, IndexError, ValueError):
+            _cmap_cache[key] = None
+    return _cmap_cache[key], shown
 
 
 def font_missing(family_css, text):
     """Yazının fontta olmayan karakterleri. (durum, eksikler, font adı)
     durum: 'ok' | 'missing' | 'nofont' (font bu bilgisayarda yok, denetlenemedi)."""
-    names = [x.strip().strip("\"'") for x in (family_css or "").split(",") if x.strip()]
-    shown = names[-1] if names else "?"
-    hit = next((font_index()[norm(n)] for n in names if norm(n) in font_index()), None)
-    ranges = font_ranges(*hit) if hit else []
-    if not ranges:
+    face, shown = find_face(family_css)
+    if face is None:
         return "nofont", [], shown
-    missing = []
-    for ch in dict.fromkeys(text):
-        if not ch.isspace() and not any(a <= ord(ch) <= b for a, b in ranges):
-            missing.append(ch)
+    missing = [ch for ch in dict.fromkeys(text) if not ch.isspace() and not face.glyph(ord(ch))]
     return ("missing" if missing else "ok"), missing, shown
+
+
+def set_attr(tag, name, val):
+    """Bir açılış etiketinde özelliği yazar (varsa değiştirir)."""
+    m = re.search(r"(?<![\w:\-])%s\s*=\s*(?:\"[^\"]*\"|'[^']*')" % re.escape(name), tag)
+    if m:
+        return tag[:m.start()] + f'{name}="{val}"' + tag[m.end():]
+    end = len(tag) - 2 if tag.endswith("/>") else len(tag) - 1
+    return tag[:end].rstrip() + f' {name}="{val}"' + tag[end:]
+
+
+def first_number(s, default=0.0):
+    m = re.match(r"\s*(-?[\d.]+(?:e-?\d+)?)", s or "")
+    try:
+        return float(m.group(1)) if m else default
+    except ValueError:
+        return default
 
 
 def set_style(tag, prop, val):
@@ -383,9 +452,35 @@ class Template:
             fam = (css_values(tm.group(0), self.css, "font-family") if tm else []) \
                 or css_values(n["attrs"], self.css, "font-family")
             n.update(own=own, stripped=stripped, family=fam[0] if fam else "",
+                     px=size[0] if size and size[1] == "px" else None,
                      sample=html.unescape(re.sub(r"<[^>]+>", "", inner)).strip(),
                      size=(fmt_num(size[0]) + size[1]) if size else "")
             self.fields.setdefault(field, []).append(n)
+
+    def extent(self, n):
+        """Şablondaki örnek yazının yerel koordinattaki (sol, sağ) kenarları; ölçülemezse None.
+        Illustrator ortalı/sağa yaslı yazıyı da sol başlangıç noktasıyla kaydeder; gerçek ortayı
+        bulmak için örnek yazının genişliği fonttan ölçülür."""
+        face, _ = find_face(n["family"])
+        if face is None or not n["px"]:
+            return None
+        cur = first_number(get_attr(n["attrs"], "x"))
+        left, right = None, cur
+        for tok in re.findall(r"<tspan\b[^>]*>|</tspan>|[^<]+", self.src[n["open_end"]:n["inner_end"]]):
+            if tok.startswith("<tspan"):
+                x = get_attr(tok, "x")
+                if x is not None:
+                    cur = first_number(x)
+            elif not tok.startswith("<") and tok.strip():
+                if left is None:
+                    left = cur
+                cur += face.width(html.unescape(tok), n["px"])
+                right = max(right, cur)
+        if left is None:
+            return None
+        anchor = (css_values(n["attrs"], self.css, "text-anchor") or ["start"])[0].strip()
+        shift = {"middle": (right - left) / 2, "end": right - left}.get(anchor, 0)
+        return left - shift, right - shift
 
     def render(self, values, cfgs):
         """values: {alan: yazı}. (bytes, küçültme notları, elle kontrol gerektiren nedenler) döndürür."""
@@ -439,13 +534,27 @@ class Template:
                         notes.append(f"{fname}: {len(val)} karakter (sınır {mx}) → font "
                                      f"{fmt_num(base[0])}{base[1]} → {new}"
                                      + (" (alt sınıra takıldı, taşabilir)" if hit else ""))
+                align = cfg.get("align", "left")
+                if align in ("center", "right"):
+                    ext = self.extent(n)
+                    if ext is None:
+                        checks.append(f"{fname}: hizalanamadı (font bu bilgisayarda kurulu değil ya da boyutu "
+                                      f"okunamadı), sola yaslı bırakıldı")
+                    else:
+                        x = fmt_num((ext[0] + ext[1]) / 2 if align == "center" else ext[1])
+                        open_tag = set_style(open_tag, "text-anchor", "middle" if align == "center" else "end")
+                        if ts_tag and get_attr(ts_tag, "x") is not None:
+                            ts_tag = set_attr(ts_tag, "x", x)
+                        else:
+                            open_tag = set_attr(open_tag, "x", x)
                 esc = xml_escape(val)
                 new_inner = (ts_tag + esc + "</tspan>") if ts_tag else esc
                 edits.append((n["open_start"], n["inner_end"], open_tag + new_inner))
         out = self.src
         for s, e, rep in sorted(edits, reverse=True):
             out = out[:s] + rep + out[e:]
-        return out.encode(self.enc), notes, list(dict.fromkeys(checks))
+        # Dosyanın kodlamasında olmayan harfler (ör. iso-8859-1'de ı, ş, ğ) &#305; biçiminde yazılır.
+        return out.encode(self.enc, errors="xmlcharrefreplace"), notes, list(dict.fromkeys(checks))
 
 
 def analyze(folder, recursive=False, exclude=None):
@@ -494,7 +603,7 @@ def build_lookup(templates):
 
 def new_field(name, use=True):
     return {"name": name, "use": use, "case": "asis", "max": 0, "minpct": 60,
-            "empty": "blank", "prefix": "", "suffix": ""}
+            "empty": "blank", "prefix": "", "suffix": "", "align": "left"}
 
 
 def apply_cfg(raw, cfg):
@@ -1282,7 +1391,8 @@ class App(tk.Tk):
         self.title(f"{APP} – {Path(self.project_file).name}" if self.project_file else APP)
 
     def new_project(self):
-        if not messagebox.askyesno(APP, "Tüm ayarlar ve tablo temizlensin mi?"):
+        if not messagebox.askyesno(APP, "Klasörler, alan ayarları ve veri tablosu sıfırlansın mı?\n\n"
+                                        "Diskteki şablon ve çıktı dosyalarına dokunulmaz.", icon="warning"):
             return
         self.load_project_dict({})
 
@@ -1351,7 +1461,9 @@ class App(tk.Tk):
         ttk.Button(g, text="Gözat…", command=lambda: self.browse(self.v_out)).grid(row=1, column=2)
         ttk.Button(g, text="Aç", width=5, command=lambda: self.open_dir(self.v_out)).grid(row=1, column=3, padx=(4, 0))
         bar = ttk.Frame(g)
-        bar.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        bar.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(g, text="Her şeyi sıfırla…", command=self.new_project).grid(
+            row=2, column=2, columnspan=2, sticky="e", pady=(6, 0))
         ttk.Button(bar, text="Analiz Et", style="Big.TButton", command=self.run_analysis).pack(side="left")
         ttk.Checkbutton(bar, text="Alt klasörleri de tara", variable=self.v_rec).pack(side="left", padx=12)
         self.lbl_tpl = ttk.Label(bar, text="Henüz analiz yapılmadı.", foreground="#555")
@@ -1360,11 +1472,11 @@ class App(tk.Tk):
         f = ttk.LabelFrame(tab, text="Bulunan alanlar (değişken olacakları 'Kullan' sütununa tıklayarak işaretleyin)",
                            padding=8)
         f.pack(fill="both", expand=True, pady=(10, 0))
-        cols = ("use", "name", "files", "miss", "sample", "size", "tr", "case", "max", "minpct", "empty",
+        cols = ("use", "name", "files", "miss", "sample", "size", "tr", "align", "case", "max", "minpct", "empty",
                 "prefix", "suffix")
         heads = ("Kullan", "Alan", "Bulunduğu şablonlar", "Eksik olduğu şablonlar", "Örnek yazı", "Font",
-                 "Fontta Türkçe harf", "Harf", "Maks. karakter", "Min. font %", "Boşsa", "Önek", "Sonek")
-        widths = (55, 110, 140, 130, 100, 75, 190, 105, 95, 80, 140, 55, 55)
+                 "Fontta Türkçe harf", "Hiza", "Harf", "Maks. karakter", "Min. font %", "Boşsa", "Önek", "Sonek")
+        widths = (55, 110, 130, 120, 95, 75, 180, 80, 105, 95, 80, 130, 50, 50)
         self.ftree = ttk.Treeview(f, columns=cols, show="headings", height=7, selectmode="browse")
         for c, h, w in zip(cols, heads, widths):
             self.ftree.heading(c, text=h)
@@ -1378,7 +1490,7 @@ class App(tk.Tk):
 
         e = ttk.LabelFrame(tab, text="Seçili alanın ayarları", padding=8)
         e.pack(fill="x", pady=(10, 0))
-        self.fv = {k: tk.StringVar() for k in ("case", "max", "minpct", "empty", "prefix", "suffix")}
+        self.fv = {k: tk.StringVar() for k in ("case", "max", "minpct", "empty", "prefix", "suffix", "align")}
         self.lbl_field = ttk.Label(e, text="(alan seçin)", font=("Segoe UI", 10, "bold"))
         self.lbl_field.grid(row=0, column=0, columnspan=8, sticky="w", pady=(0, 6))
         ttk.Label(e, text="Harf dönüşümü:").grid(row=1, column=0, sticky="w")
@@ -1396,9 +1508,14 @@ class App(tk.Tk):
         ttk.Label(e, text="En fazla şu kadar küçült (%):").grid(row=2, column=2, sticky="w", padx=(14, 0), pady=(8, 0))
         ttk.Spinbox(e, textvariable=self.fv["minpct"], from_=10, to=100, increment=5, width=6).grid(
             row=2, column=3, padx=6, sticky="w", pady=(8, 0))
-        ttk.Label(e, foreground="#555", text=(
+        ttk.Label(e, text="Hizalama:").grid(row=2, column=4, sticky="w", padx=(14, 0), pady=(8, 0))
+        ttk.Combobox(e, textvariable=self.fv["align"], values=list(ALIGN.values()), state="readonly",
+                     width=14).grid(row=2, column=5, columnspan=3, padx=6, sticky="w", pady=(8, 0))
+        ttk.Label(e, foreground="#555", justify="left", text=(
             "Yazı 'Maks. karakter'den uzunsa font boyutu orantılı küçültülür (0 = kapalı). "
-            "Örn. sınır 8, yazı 10 harf → font %80. Alt sınır: orijinal boyutun yüzdesi.")
+            "Örn. sınır 8, yazı 10 harf → font %80. Alt sınır: orijinal boyutun yüzdesi.\n"
+            "Hizalama: Illustrator ortalı yazıyı SVG'ye sola yaslı kaydeder. 'Ortalı' seçerseniz yeni yazı, "
+            "şablondaki örnek yazının ortasına göre yerleşir (font bu bilgisayarda kurulu olmalı).")
                   ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(8, 0))
         for v in self.fv.values():
             v.trace_add("write", self._field_changed)
@@ -1453,7 +1570,7 @@ class App(tk.Tk):
         stems = [t.stem for t in self.templates]
         miss = [s for s in stems if s not in info["files"]]
         return ("☑" if f["use"] else "☐", f["name"], ", ".join(info["files"]), ", ".join(miss) or "–",
-                info["sample"], info["size"], info["tr"], CASES.get(f["case"], ""), f["max"] or "kapalı", f["minpct"],
+                info["sample"], info["size"], info["tr"], ALIGN.get(f["align"], ""), CASES.get(f["case"], ""), f["max"] or "kapalı", f["minpct"],
                 EMPTY.get(f["empty"], ""), f["prefix"], f["suffix"])
 
     def refresh_fields(self):
@@ -1489,6 +1606,7 @@ class App(tk.Tk):
         self.lbl_field.config(text=f"Alan: {f['name']}")
         self.fv["case"].set(CASES.get(f["case"], CASES["asis"]))
         self.fv["empty"].set(EMPTY.get(f["empty"], EMPTY["blank"]))
+        self.fv["align"].set(ALIGN.get(f["align"], ALIGN["left"]))
         self.fv["max"].set(str(f["max"]))
         self.fv["minpct"].set(str(f["minpct"]))
         self.fv["prefix"].set(f["prefix"])
@@ -1502,6 +1620,7 @@ class App(tk.Tk):
         f = self.fields[int(sel[0])]
         f["case"] = next((k for k, v in CASES.items() if v == self.fv["case"].get()), "asis")
         f["empty"] = next((k for k, v in EMPTY.items() if v == self.fv["empty"].get()), "blank")
+        f["align"] = next((k for k, v in ALIGN.items() if v == self.fv["align"].get()), "left")
         try:
             f["max"] = max(0, int(self.fv["max"].get()))
         except ValueError:
@@ -1523,7 +1642,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="+ Satır ekle", command=self.add_row).pack(side="left")
         ttk.Button(bar, text="+ 10 satır", command=lambda: self.add_row(10)).pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="Seçilenleri sil", command=self.delete_rows).pack(side="left", padx=4)
-        ttk.Button(bar, text="Tümünü temizle", command=self.clear_rows).pack(side="left")
+        ttk.Button(bar, text="Veriyi sıfırla", command=self.clear_rows).pack(side="left")
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(bar, text="Toplu giriş…", style="Big.TButton", command=self.bulk_dialog).pack(side="left")
         ttk.Button(bar, text="Excel / CSV yükle…", command=self.import_file).pack(side="left", padx=4)
