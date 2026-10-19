@@ -4,6 +4,7 @@ build/
 dist/
 *.spec
 *.exe
-svg-varyant-oturum.json
+grafik-varyant-oturum.json
 *.svgproje
-svg-varyant-ai-onbellek.json
+grafik-varyant-ai-onbellek.json
+svg-varyant-oturum.json

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""SVG Varyant Üretici
+"""Grafik Varyant Üretici
 
-Şablon dosyalarındaki (.ai / .eps Illustrator ile, .svg doğrudan) isimlendirilmiş yazı katmanlarını
-(ör. NAME_S, NUMBER_M) bir tablodaki verilerle doldurup her satır için ayrı dosya üretir.
+Şablon dosyalarındaki (SVG; Illustrator ile .ai/.eps; Illustrator'süz PDF) isimlendirilmiş yazı
+alanlarını (ör. NAME_S, NUMBER_M) bir tablodaki verilerle doldurup her satır için ayrı dosya üretir.
 """
 import csv
 import datetime
@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
-APP = "SVG Varyant Üretici"
+APP = "Grafik Varyant Üretici"
 COL_T = "Beden"  # her satırın hangi şablon dosyasıyla üretileceğini söyleyen sütun
 COL_T_OLD = "Şablon"
 COL_F = "Dosya Adı"
@@ -733,7 +733,7 @@ def illustrator():
 
 
 def ai_cache_path():
-    return session_path().with_name("svg-varyant-ai-onbellek.json")
+    return session_path().with_name("grafik-varyant-ai-onbellek.json")
 
 
 def ai_frames(path):
@@ -837,31 +837,430 @@ class AiTemplate:
                           for i, e in edits.items()}
 
 
-TEMPLATE_EXTS = (".svg",) + AI_EXTS
+# ----------------------------------------------------------------------------
+# Çekirdek: PDF şablonlar (Illustrator gerekmez)
+# ----------------------------------------------------------------------------
+# PDF'te yazı, içerik akışındaki "yazı göster" komutlarıdır (Tj, TJ, ', "). Alanın komutu yerinde
+# değiştirilir: önceki renk, saydamlık, katman ve konum ayarları aynen geçerli kalır; yalnızca font
+# bilgisayardaki tam fonta çevrilir (PDF'e gömülü font alt kümesinde yeni harfler bulunmayabilir).
+# Alanlar iki yolla bulunur: yazının kendisi {NAME} biçiminde bir yer tutucuysa, ya da yazı NAME_M gibi
+# adlandırılmış bir Acrobat katmanındaysa (Illustrator: PDF kaydederken "Üst düzey katmanlardan Acrobat
+# katmanları oluştur").
+
+PDF_WS = b" \t\r\n\f\x00"
+PDF_DELIM = b"()<>[]{}/%"
+PDF_SHOW = (b"Tj", b"TJ", b"'", b'"')
+PLACEHOLDER_RE = re.compile(r"^\s*\{\s*([^{}]+?)\s*\}\s*$")
 
 
-def analyze(folder, recursive=False, exclude=None, progress=None):
+def _pdf_literal(raw):
+    """(...) dizgesinin bayt değeri."""
+    out, i, body = bytearray(), 0, raw[1:-1]
+    esc = {ord("n"): 10, ord("r"): 13, ord("t"): 9, ord("b"): 8, ord("f"): 12}
+    while i < len(body):
+        c = body[i]
+        if c != 0x5C:
+            out.append(c)
+            i += 1
+            continue
+        i += 1
+        if i >= len(body):
+            break
+        c = body[i]
+        if c in esc:
+            out.append(esc[c])
+            i += 1
+        elif 0x30 <= c <= 0x37:
+            j = i
+            while j < len(body) and j < i + 3 and 0x30 <= body[j] <= 0x37:
+                j += 1
+            out.append(int(body[i:j], 8) & 0xFF)
+            i = j
+        elif c in (10, 13):  # satır devamı
+            i += 2 if c == 13 and body[i + 1:i + 2] == b"\n" else 1
+        else:
+            out.append(c)
+            i += 1
+    return bytes(out)
+
+
+def _pdf_hex(raw):
+    h = re.sub(rb"[^0-9A-Fa-f]", b"", raw[1:-1])
+    return bytes.fromhex((h + b"0" if len(h) % 2 else h).decode("ascii"))
+
+
+def pdf_show_ops(data):
+    """İçerik akışındaki yazı komutları ve form nesnesi çağrıları, sırasıyla.
+    ("show", {...}) ya da ("do", ad). Her yazı komutu: bayt aralığı, o anki font kaynağı ve ayarlar, dizgeler."""
+    out, stack, marks = [], [], []
+    st = {"font": None, "tfs": 1.0, "tc": 0.0, "tw": 0.0, "th": 1.0, "ratio": 1.0, "bt": 0}
+    saved = []
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i]
+        if c in PDF_WS:
+            i += 1
+            continue
+        if c == 0x25:  # yorum
+            m = re.compile(rb"[\r\n]").search(data, i)
+            i = m.end() if m else n
+            continue
+        start = i
+        if c == 0x28:
+            depth, j = 0, i
+            while j < n:
+                ch = data[j]
+                if ch == 0x5C:
+                    j += 2
+                    continue
+                if ch == 0x28:
+                    depth += 1
+                elif ch == 0x29:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            stack.append(("str", _pdf_literal(data[i:j + 1]), start))
+            i = j + 1
+            continue
+        if c == 0x3C:
+            if data[i + 1:i + 2] == b"<":
+                marks.append(len(stack))
+                stack.append(("mark", None, start))
+                i += 2
+            else:
+                j = data.find(b">", i)
+                j = n - 1 if j < 0 else j
+                stack.append(("str", _pdf_hex(data[i:j + 1]), start))
+                i = j + 1
+            continue
+        if c == 0x3E and data[i + 1:i + 2] == b">":
+            k = marks.pop() if marks else 0
+            first = stack[k][2] if k < len(stack) else start
+            del stack[k:]
+            stack.append(("dict", None, first))
+            i += 2
+            continue
+        if c == 0x5B:
+            marks.append(len(stack))
+            stack.append(("mark", None, start))
+            i += 1
+            continue
+        if c == 0x5D:
+            k = marks.pop() if marks else 0
+            first = stack[k][2] if k < len(stack) else start
+            items = [x for x in stack[k + 1:]]
+            del stack[k:]
+            stack.append(("arr", items, first))
+            i += 1
+            continue
+        if c in (0x7B, 0x7D):
+            i += 1
+            continue
+        j = i + 1
+        while j < n and data[j] not in PDF_WS and data[j] not in PDF_DELIM:
+            j += 1
+        tok = data[i:j]
+        i = j
+        if c == 0x2F:
+            stack.append(("name", tok[1:].decode("latin-1"), start))
+            continue
+        try:
+            stack.append(("num", float(tok), start))
+            continue
+        except ValueError:
+            pass
+        if tok in (b"true", b"false", b"null"):
+            stack.append(("kw", tok, start))
+            continue
+        # Operatör
+        ops = stack
+        stack, marks = [], []
+        first = ops[0][2] if ops else start
+        nums = [x[1] for x in ops if x[0] == "num"]
+        if tok == b"ID":  # satır içi görsel: EI'ye kadar atla
+            m = re.compile(rb"\sEI(?=[\s/\[<(]|$)").search(data, i)
+            i = m.end() if m else n
+        elif tok == b"q":
+            saved.append(dict(st))
+        elif tok == b"Q":
+            if saved:
+                bt = st["bt"]
+                st = saved.pop()
+                st["bt"] = bt
+        elif tok == b"BT":
+            st["bt"] += 1
+            st["ratio"] = 1.0
+        elif tok == b"Tf" and len(ops) >= 2 and ops[0][0] == "name":
+            st["font"], st["tfs"] = ops[0][1], ops[1][1] if ops[1][0] == "num" else st["tfs"]
+        elif tok == b"Tc" and nums:
+            st["tc"] = nums[-1]
+        elif tok == b"Tw" and nums:
+            st["tw"] = nums[-1]
+        elif tok == b"Tz" and nums:
+            st["th"] = nums[-1] / 100.0
+        elif tok == b"Tm" and len(nums) >= 4:
+            a, b, cc, d = nums[:4]
+            sy = (cc * cc + d * d) ** 0.5
+            st["ratio"] = ((a * a + b * b) ** 0.5) / sy if sy else 1.0
+        elif tok == b'"' and len(nums) >= 2:
+            st["tw"], st["tc"] = nums[0], nums[1]
+        elif tok == b"Do" and ops and ops[0][0] == "name":
+            out.append(("do", ops[0][1]))
+        if tok in PDF_SHOW:
+            strings = []
+            for x in ops:
+                if x[0] == "str":
+                    strings.append(x[1])
+                elif x[0] == "arr":
+                    strings += [y[1] for y in x[1] if y[0] == "str"]
+            out.append(("show", dict(st, op=tok.decode(), start=first, end=i, strings=strings)))
+    return out
+
+
+def sfnt_face(path, off):
+    """Font dosyasından tek yüz: .ttc koleksiyonundaysa ayrı bir .ttf/.otf olarak çıkarılır."""
+    raw = Path(path).read_bytes()
+    if raw[:4] != b"ttcf":
+        return raw
+    with open(path, "rb") as f:
+        tabs = _tables(f, off)
+    tags = sorted(tabs)
+    num = len(tags)
+    es = max(k for k in range(16) if 2 ** k <= num)
+    head = raw[off:off + 4] + struct.pack(">HHHH", num, 16 * 2 ** es, es, num * 16 - 16 * 2 ** es)
+    body, recs, pos = b"", b"", 12 + 16 * num
+    for t in tags:
+        o, ln = tabs[t]
+        chunk = raw[o:o + ln]
+        recs += t + struct.pack(">III", 0, pos + len(body), ln)
+        body += chunk + b"\0" * (-ln % 4)
+    return head + recs + body
+
+
+def pdf_font_name(name):
+    """'ABCDEF+Arial-BoldMT' -> 'Arial-BoldMT'"""
+    return re.sub(r"^[A-Z]{6}\+", "", name or "")
+
+
+def pdf_scan(doc):
+    """Her yazı komutu için içerik akışındaki yeri, ayarları ve PyMuPDF'in okuduğu harfler (konum, font, katman)."""
+    import pymupdf
+    result = []
+    for page in doc:
+        fonts = {(f[6], f[4]): f[2] for f in page.get_fonts(full=True)}
+        xobjs = {(x[2], x[1]): x[0] for x in page.get_xobjects()}
+        ops = []
+
+        def walk(xref, data, holder, depth=0):
+            for kind, v in pdf_show_ops(data):
+                if kind == "do":
+                    x = xobjs.get((holder, v)) or xobjs.get((0, v))
+                    if x and depth < 8:
+                        walk(x, doc.xref_stream(x) or b"", x, depth + 1)
+                    continue
+                ftype = fonts.get((holder, v["font"])) or fonts.get((0, v["font"]), "")
+                width = 2 if ftype == "Type0" else 1
+                v.update(stream=xref, holder=holder, nchars=sum(len(s) // width for s in v["strings"]))
+                ops.append(v)
+
+        walk(0, page.read_contents(), 0)
+        chars = [(ch, sp) for sp in page.get_texttrace() for ch in sp["chars"]]
+        if sum(o["nchars"] for o in ops) != len(chars):
+            raise ValueError(f"{page.number + 1}. sayfanın yazı yapısı çözümlenemedi "
+                             f"({sum(o['nchars'] for o in ops)} / {len(chars)} harf)")
+        pos = 0
+        for o in ops:
+            o["chars"] = chars[pos:pos + o["nchars"]]
+            pos += o["nchars"]
+            o["text"] = "".join(chr(ch[0]) for ch, _ in o["chars"] if ch[0] > 0)
+        result.append(ops)
+    return result
+
+
+class PdfTemplate:
+    kind = "pdf"
+
+    def __init__(self, path):
+        import pymupdf
+        self.path = Path(path)
+        self.stem = self.path.stem
+        self.fields = {}
+        with pymupdf.open(self.path) as doc:
+            pages = pdf_scan(doc)
+        for pno, ops in enumerate(pages):
+            used = set()
+            # 1) {ALAN} yer tutucuları: aynı BT bloğunda art arda gelen komutların birleşik yazısı
+            for k, o in enumerate(ops):
+                if k in used or not o["text"].strip().startswith("{"):
+                    continue
+                text, group = "", []
+                for j in range(k, len(ops)):
+                    if ops[j]["bt"] != o["bt"] or ops[j]["stream"] != o["stream"]:
+                        break
+                    text += ops[j]["text"]
+                    group.append(j)
+                    m = PLACEHOLDER_RE.match(text)
+                    if m or "}" in text:
+                        break
+                m = PLACEHOLDER_RE.match(text)
+                if m:
+                    used.update(group)
+                    self._add(m.group(1), True, False, pno, ops, group)
+            # 2) ALAN_ŞABLON adlı katmandaki yazılar
+            layers = {}
+            for k, o in enumerate(ops):
+                if k not in used and o["chars"] and o["chars"][0][1].get("layer"):
+                    layers.setdefault(o["chars"][0][1]["layer"], []).append(k)
+            for name, group in layers.items():
+                field, stripped = split_field(name.strip(), self.stem)
+                if stripped:
+                    self._add(field, False, True, pno, ops, group)
+
+    def _add(self, field, own, stripped, pno, ops, group):
+        group = [k for k in group if ops[k]["chars"]] or group
+        first, last = ops[group[0]], ops[group[-1]]
+        sp = first["chars"][0][1] if first["chars"] else {"font": "", "size": 0, "dir": (1, 0)}
+        dx, dy = sp.get("dir", (1, 0))
+        if first["chars"] and last["chars"]:
+            o0, b1 = first["chars"][0][0][2], last["chars"][-1][0][3]
+            # Yazı yönünde baştaki harfin başlangıcından sondakinin bitişine kadar uzunluk
+            right = max((b1[0] - o0[0]) * dx + (b1[1] - o0[1]) * dy, (b1[2] - o0[0]) * dx + (b1[3] - o0[1]) * dy)
+        else:
+            right = 0
+        font = pdf_font_name(sp.get("font"))
+        size = float(sp.get("size") or 0)
+        text = "".join(ops[k]["text"] for k in group)
+        self.fields.setdefault(field, []).append({
+            "page": pno, "ops": [{key: ops[k][key] for key in
+                                  ("stream", "holder", "start", "end", "op", "font", "tfs", "tc", "tw", "th", "ratio")}
+                                 for k in group],
+            "own": own, "stripped": stripped, "family": font, "pt": size, "width": right,
+            "scale": size / first["tfs"] if first["tfs"] else 1.0,
+            "sample": re.sub(r"\s+", " ", text).strip(), "size": f"{fmt_num(size)}pt" if size else ""})
+
+    def render(self, values, cfgs):
+        """(alan düzenlemeleri, küçültme notları, elle kontrol gerektiren nedenler)"""
+        edits, notes, checks = [], [], []
+        for fname, nodes in self.fields.items():
+            if fname not in values:
+                continue
+            val = values[fname]
+            cfg = cfgs.get(fname, {})
+            mx, minpct = field_limits(cfg)
+            for n in nodes:
+                if find_face(n["family"])[0] is None:
+                    checks.append(f"{fname}: '{n['family']}' fontu bu bilgisayarda yok, PDF'e yazılamaz")
+                else:
+                    checks += font_checks(fname, n["family"], val)
+                ratio = 1.0
+                if mx > 0 and len(val) > mx:
+                    checks.append(f"{fname}: uzun yazı ({len(val)} karakter, sınır {mx})")
+                    floor = minpct / 100.0
+                    ratio = max(mx / len(val), floor)
+                    notes.append(f"{fname}: {len(val)} karakter (sınır {mx}) → font {fmt_num(n['pt'])}pt → "
+                                 f"{fmt_num(n['pt'] * ratio)}pt"
+                                 + (" (alt sınıra takıldı, taşabilir)" if mx / len(val) < floor else ""))
+                edits.append((n, val, ratio, cfg.get("align", "center")))
+        return edits, notes, list(dict.fromkeys(checks))
+
+    def out_ext(self, opts):
+        return ".pdf"
+
+    def write(self, edits, target, opts):
+        import pymupdf
+        doc = pymupdf.open(self.path)
+        try:
+            self._apply(doc, edits)
+            for page in doc:
+                # Illustrator'ın kendi düzenleme verisi kalırsa Illustrator dosyayı eski haliyle açar.
+                doc.xref_set_key(page.xref, "PieceInfo", "null")
+            try:
+                doc.subset_fonts()  # fontTools gerekir; yoksa fontlar tam gömülür (dosya büyür)
+            except Exception:
+                pass
+            doc.save(str(target), garbage=3, deflate=True)
+        finally:
+            doc.close()
+
+    def _apply(self, doc, edits):
+        import pymupdf
+        splices = {}  # (sayfa, akış) -> [(baş, son, yeni bayt)]
+        fonts = {}  # (sayfa, kaynak sahibi, font adı) -> (kaynak adı, pymupdf.Font)
+        for n, val, ratio, align in edits:
+            face, shown = find_face(n["family"])
+            if face is None:
+                raise OSError(f"'{shown}' fontu bu bilgisayarda bulunamadı, PDF'e yazılamadı")
+            page = doc[n["page"]]
+            first = n["ops"][0]
+            key = (n["page"], first["holder"], n["family"])
+            if key not in fonts:
+                buf = sfnt_face(*font_index()[norm(n["family"])])
+                res = f"SVF{len(fonts)}"
+                fx = page.insert_font(fontname=res, fontbuffer=buf)
+                if first["holder"]:
+                    kind, val_ = doc.xref_get_key(first["holder"], "Resources/Font")
+                    if kind == "xref":
+                        doc.xref_set_key(int(val_.split()[0]), res, f"{fx} 0 R")
+                    else:
+                        doc.xref_set_key(first["holder"], f"Resources/Font/{res}", f"{fx} 0 R")
+                fonts[key] = (res, pymupdf.Font(fontbuffer=buf))
+            res, font = fonts[key]
+            text = val.replace("\r", " ").replace("\n", " ")
+            tfs = first["tfs"] * ratio
+            codes = "".join(f"{font.has_glyph(ord(ch)):04X}" for ch in text)
+            # Yeni yazının, komutun yazı uzayındaki genişliği (harf/kelime aralığı ve yatay ölçek dahil)
+            w_new = (font.text_length(text, fontsize=tfs) + first["tc"] * len(text)
+                     + first["tw"] * text.count(" ")) * first["th"]
+            w_old = n["width"] / (n["scale"] * first["ratio"]) if n["scale"] else 0
+            shift = {"center": (w_old - w_new) / 2, "right": w_old - w_new}.get(align, 0) / first["th"] if text else 0
+            pre = {"'": "T* ", '"': "T* "}.get(first["op"], "")
+            new = f" {pre}/{res} {tfs:.4f} Tf "
+            if shift:
+                new += f"{shift:.3f} 0 Td <{codes}> Tj {-shift:.3f} 0 Td "
+            else:
+                new += f"<{codes}> Tj "
+            if first["font"]:
+                new += f"/{first['font']} {fmt_num(first['tfs'])} Tf "
+            splices.setdefault((n["page"], first["stream"]), []).append((first["start"], first["end"], new.encode()))
+            for o in n["ops"][1:]:  # alanın diğer parçaları silinir
+                splices.setdefault((n["page"], o["stream"]), []).append(
+                    (o["start"], o["end"], b" T* " if o["op"] in ("'", '"') else b" "))
+        for (pno, xref), items in splices.items():
+            page = doc[pno]
+            data = page.read_contents() if xref == 0 else doc.xref_stream(xref)
+            for s, e, rep in sorted(items, reverse=True):
+                data = data[:s] + rep + data[e:]
+            if xref == 0:
+                cont = page.get_contents()
+                doc.update_stream(cont[0], data)
+                if len(cont) > 1:
+                    page.set_contents(cont[0])
+            else:
+                doc.update_stream(xref, data)
+
+
+MODES = {
+    "svg": {"title": "SVG", "exts": (".svg",), "cls": Template},
+    "eps": {"title": "EPS (Illustrator ile)", "exts": AI_EXTS, "cls": AiTemplate},
+    "pdf": {"title": "PDF (Illustrator'süz)", "exts": (".pdf",), "cls": PdfTemplate},
+}
+
+
+def analyze(folder, recursive=False, exclude=None, progress=None, mode="svg"):
     folder = Path(folder)
+    exts = MODES[mode]["exts"]
     found = folder.rglob("*") if recursive else folder.glob("*")
-    paths = sorted((p for p in found if p.suffix.lower() in TEMPLATE_EXTS and p.is_file()),
-                   key=lambda p: str(p).lower())
+    paths = sorted((p for p in found if p.suffix.lower() in exts and p.is_file()), key=lambda p: str(p).lower())
     if exclude:
         ex = Path(exclude).resolve()
         if ex != folder.resolve():
             paths = [p for p in paths if ex not in p.resolve().parents]
-    # Aynı adlı şablon birden fazla biçimde varsa (M.ai ve M.svg) Illustrator dosyası kullanılır.
-    rank = {".ai": 0, ".eps": 1, ".svg": 2}
-    best = {}
-    for p in paths:
-        k = (str(p.parent).lower(), p.stem.lower())
-        if k not in best or rank[p.suffix.lower()] < rank[best[k].suffix.lower()]:
-            best[k] = p
-    paths = [p for p in paths if best[(str(p.parent).lower(), p.stem.lower())] is p]
     out = []
     for k, p in enumerate(paths, 1):
         if progress:
             progress(k, len(paths), p.name)
-        out.append(AiTemplate(p) if p.suffix.lower() in AI_EXTS else Template(p))
+        out.append(MODES[mode]["cls"](p))
     return out
 
 
@@ -899,9 +1298,9 @@ def build_lookup(templates):
     return m
 
 
-def new_field(name, use=True):
+def new_field(name, use=True, align="left"):
     return {"name": name, "use": use, "case": "asis", "max": 0, "minpct": 60,
-            "empty": "blank", "prefix": "", "suffix": "", "align": "left"}
+            "empty": "blank", "prefix": "", "suffix": "", "align": align}
 
 
 def apply_cfg(raw, cfg):
@@ -1301,13 +1700,15 @@ def resource_path(rel):
     return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / rel
 
 
-def session_path():
+def session_path(old=False):
     # Taşınabilir exe: ayarlar exe'nin yanında durur (klasör yazılabilirse), yoksa kullanıcı profilinde.
+    # old=True: programın eski adı (SVG Varyant Üretici) döneminden kalan oturum dosyası.
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
         if os.access(exe_dir, os.W_OK):
-            return exe_dir / "svg-varyant-oturum.json"
-    return Path(os.environ.get("APPDATA") or Path.home()) / "SVGVaryantUretici" / "oturum.json"
+            return exe_dir / ("svg-varyant-oturum.json" if old else "grafik-varyant-oturum.json")
+    return Path(os.environ.get("APPDATA") or Path.home()) / ("SVGVaryantUretici" if old else "GrafikVaryantUretici") \
+        / "oturum.json"
 
 
 def open_path(p):
@@ -1322,10 +1723,10 @@ class BulkDialog(tk.Toplevel):
     Aynı satır numarasındaki değerler tablonun aynı satırını oluşturur."""
 
     def __init__(self, app, focus_col=None, paste_text=""):
-        super().__init__(app)
+        super().__init__(app.winfo_toplevel())
         self.app = app
         self.title("Toplu giriş")
-        self.transient(app)
+        self.transient(app.winfo_toplevel())
         self.cols = app.data_columns()
         self.geometry(f"{min(1500, max(760, 110 + 215 * len(self.cols)))}x660")
         self.texts, self.heads = {}, {}
@@ -1495,11 +1896,11 @@ class ImportDialog(tk.Toplevel):
     """Dosyadan okunan satırları tablo sütunlarına eşler."""
 
     def __init__(self, app, rows, title="Veri içe aktar"):
-        super().__init__(app)
+        super().__init__(app.winfo_toplevel())
         self.app = app
         self.title(title)
         self.geometry("900x560")
-        self.transient(app)
+        self.transient(app.winfo_toplevel())
         self.raw = rows
         self.combos = []
         self.header = tk.BooleanVar(value=False)
@@ -1591,7 +1992,26 @@ class ImportDialog(tk.Toplevel):
         self.destroy()
 
 
+MODE_HINT = {
+    "svg": "SVG şablonlar: değişecek yazılara Illustrator'da ALAN_ŞABLON adı verin (ör. M.svg içinde NAME_M).",
+    "eps": ".ai / .eps şablonlar Illustrator ile açılıp düzenlenir (Illustrator kurulu olmalı). Yazı nesnesine "
+           "ya da yalnız onu içeren katmana ALAN_ŞABLON adı verin (ör. M.ai içinde NAME_M).",
+    "pdf": "PDF şablonlar Illustrator olmadan düzenlenir. Alanı bulmak için yazıyı {NAME} gibi süslü parantezle "
+           "yazın ya da NAME_M adlı bir katmana koyup PDF'i 'Acrobat katmanları oluştur' seçeneğiyle kaydedin.",
+}
+ALIGN_HINT = {
+    "svg": "Hizalama: Illustrator ortalı yazıyı SVG'ye sola yaslı kaydeder; 'Ortalı' seçilirse yeni yazı örnek "
+           "yazının fonttan ölçülen ortasına göre yerleşir (font bu bilgisayarda kurulu olmalı).",
+    "eps": "Hizalama: Illustrator'daki paragraf hizası aynen korunur; 'Ortalı'/'Sağa yaslı' ayrıca yeni yazıyı "
+           "örnek yazının ortasına/sağ kenarına oturtur.",
+    "pdf": "Hizalama: PDF'te paragraf hizası bilgisi yoktur; yeni yazı örnek yazının sol kenarına, ortasına ya da "
+           "sağ kenarına göre yerleşir. Yazı, PDF'teki fontun bu bilgisayarda kurulu tam haliyle yazılır.",
+}
+
+
 class App(tk.Tk):
+    """Ana pencere: her şablon türü (SVG, EPS, PDF) ayrı bir sekmede, kendi ayarları ve tablosuyla."""
+
     def __init__(self, load_session=True):
         super().__init__()
         self.title(APP)
@@ -1599,8 +2019,139 @@ class App(tk.Tk):
             self.iconbitmap(default=str(resource_path("assets/app.ico")))
         except tk.TclError:
             pass
-        self.geometry("1180x760")
-        self.minsize(980, 620)
+        self.geometry("1180x800")
+        self.minsize(980, 640)
+        lh = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        st = ttk.Style(self)
+        st.configure("Treeview", rowheight=lh + 8)
+        st.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
+        st.configure("Mode.TNotebook.Tab", font=("Segoe UI", 11, "bold"), padding=(16, 6))
+
+        self._menu()
+        self.status = ttk.Label(self, text="Hazır", anchor="w", relief="sunken")
+        self.status.pack(fill="x", side="bottom")
+        self.tabs = ttk.Notebook(self, style="Mode.TNotebook")
+        self.tabs.pack(fill="both", expand=True, padx=6, pady=6)
+        self.spaces = {}
+        for mode, info in MODES.items():
+            w = Workspace(self.tabs, self, mode)
+            self.tabs.add(w, text=info["title"])
+            self.spaces[mode] = w
+        self.tabs.bind("<<NotebookTabChanged>>", lambda e: self.update_title())
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        if load_session:
+            sp = session_path()
+            if not sp.exists():
+                sp = session_path(old=True)
+            if sp.exists():
+                try:
+                    self.load_session(json.loads(sp.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+
+    @property
+    def ws(self):
+        return self.nametowidget(self.tabs.select())
+
+    def load_session(self, d):
+        if "modes" not in d:  # eski oturum: tek sekme vardı (SVG)
+            d = {"modes": {"svg": d}, "active": "svg"}
+        for mode, w in self.spaces.items():
+            if mode in d["modes"]:
+                w.load_project_dict(d["modes"][mode])
+        if d.get("active") in self.spaces:
+            self.tabs.select(self.spaces[d["active"]])
+
+    # ---- menü ve proje dosyası ----
+    def _menu(self):
+        mb = tk.Menu(self)
+        m = tk.Menu(mb, tearoff=0)
+        m.add_command(label="Yeni proje (bu sekme)", command=lambda: self.ws.new_project())
+        m.add_command(label="Proje aç…", command=self.open_project, accelerator="Ctrl+O")
+        m.add_command(label="Projeyi kaydet", command=self.save_project, accelerator="Ctrl+S")
+        m.add_command(label="Projeyi farklı kaydet…", command=lambda: self.save_project(True))
+        m.add_separator()
+        m.add_command(label="Çıkış", command=self.on_close)
+        mb.add_cascade(label="Dosya", menu=m)
+        h = tk.Menu(mb, tearoff=0)
+        h.add_command(label="Nasıl kullanılır?", command=self.show_help)
+        mb.add_cascade(label="Yardım", menu=h)
+        self.config(menu=mb)
+        self.bind("<Control-s>", lambda e: self.save_project())
+        self.bind("<Control-o>", lambda e: self.open_project())
+
+    def update_title(self):
+        try:
+            pf = self.ws.project_file
+        except (KeyError, AttributeError, tk.TclError):  # sekmeler henüz kuruluyor
+            pf = None
+        self.title(f"{APP} – {Path(pf).name}" if pf else APP)
+
+    def open_project(self):
+        p = filedialog.askopenfilename(title="Proje aç", filetypes=[("Varyant projesi", "*.svgproje"), ("Tümü", "*.*")])
+        if not p:
+            return
+        try:
+            d = json.loads(Path(p).read_text(encoding="utf-8"))
+        except Exception as e:
+            messagebox.showerror(APP, f"Proje okunamadı:\n{e}")
+            return
+        d["project_file"] = p
+        w = self.spaces.get(d.get("mode"), self.spaces["svg"])
+        self.tabs.select(w)
+        w.load_project_dict(d)
+
+    def save_project(self, ask=False):
+        w = self.ws
+        p = w.project_file
+        if ask or not p:
+            p = filedialog.asksaveasfilename(title="Projeyi kaydet", defaultextension=".svgproje",
+                                             filetypes=[("Varyant projesi", "*.svgproje")])
+            if not p:
+                return
+        w.project_file = p
+        try:
+            Path(p).write_text(json.dumps(w.project_dict(), ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError as e:
+            messagebox.showerror(APP, f"Kaydedilemedi:\n{e}")
+            return
+        self.update_title()
+        self.status.config(text=f"Proje kaydedildi: {p}")
+
+    def on_close(self):
+        try:
+            sp = session_path()
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            d = {"version": 2, "active": self.ws.mode,
+                 "modes": {m: w.project_dict() for m, w in self.spaces.items()}}
+            sp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+        self.destroy()
+
+    def show_help(self):
+        messagebox.showinfo(APP, (
+            "Üstteki sekmeler şablon türleridir; her sekmenin klasörleri, alanları ve tablosu ayrıdır:\n"
+            "  • SVG: .svg şablonlardan SVG üretir.\n"
+            "  • EPS (Illustrator ile): .ai/.eps şablonları Illustrator'da doldurup EPS, PDF ya da AI kaydeder.\n"
+            "  • PDF (Illustrator'süz): .pdf şablonları doğrudan doldurup PDF kaydeder.\n\n"
+            "1) Değişecek yazılara ALAN_ŞABLON adı verin (ör. M şablonunda NAME_M). PDF'te yazıyı {NAME} gibi\n"
+            "    süslü parantezle de yazabilirsiniz. Dosya adı şablonun (bedenin) adıdır.\n\n"
+            "2) 'Proje ve Analiz' sekmesinde şablon klasörünü seçip 'Analiz Et'e basın.\n"
+            "    Bulunan alanlardan hangilerinin değişken olduğunu işaretleyin.\n\n"
+            "3) 'Veri' sekmesinde tabloyu doldurun: 'Toplu giriş' ile sütun sütun yapıştırarak,\n"
+            "    elle ya da Excel/CSV yükleyerek.\n\n"
+            "4) 'İsimlendirme ve Seçenekler' sekmesinde dosya adı kalıbını ve kuralları belirleyin.\n\n"
+            "5) 'Üret' sekmesinde önce 'Kontrol Et', sonra 'ÜRET'."))
+
+
+class Workspace(ttk.Frame):
+    """Bir şablon türünün tam iş akışı: klasörler ve analiz, veri, isimlendirme, üretim."""
+
+    def __init__(self, master, app, mode):
+        super().__init__(master)
+        self.app, self.mode = app, mode
+        self.status = app.status
         self.templates = []
         self.fields = []
         self.rows = []
@@ -1608,11 +2159,6 @@ class App(tk.Tk):
         self.last_report = ""
         self._loading = False
         self._editor = None
-
-        lh = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-        st = ttk.Style(self)
-        st.configure("Treeview", rowheight=lh + 8)
-        st.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
 
         self.v_tpl = tk.StringVar()
         self.v_out = tk.StringVar()
@@ -1627,48 +2173,19 @@ class App(tk.Tk):
         self.v_checkdir = tk.BooleanVar(value=True)
         self.v_fmt = tk.StringVar(value="eps")
 
-        self._menu()
         self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self.nb.pack(fill="both", expand=True, padx=4, pady=4)
         self._tab_project()
         self._tab_data()
         self._tab_options()
         self._tab_run()
-        self.status = ttk.Label(self, text="Hazır", anchor="w", relief="sunken")
-        self.status.pack(fill="x", side="bottom")
 
         self.v_pattern.trace_add("write", lambda *a: self.update_name_preview())
         self.v_fmt.trace_add("write", lambda *a: self.update_name_preview())
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        if load_session:
-            sp = session_path()
-            if sp.exists():
-                try:
-                    self.load_project_dict(json.loads(sp.read_text(encoding="utf-8")))
-                except Exception:
-                    pass
         self.refresh_table()
 
-    # ---- menü ve proje dosyası ----
-    def _menu(self):
-        mb = tk.Menu(self)
-        m = tk.Menu(mb, tearoff=0)
-        m.add_command(label="Yeni proje", command=self.new_project)
-        m.add_command(label="Proje aç…", command=self.open_project, accelerator="Ctrl+O")
-        m.add_command(label="Projeyi kaydet", command=self.save_project, accelerator="Ctrl+S")
-        m.add_command(label="Projeyi farklı kaydet…", command=lambda: self.save_project(True))
-        m.add_separator()
-        m.add_command(label="Çıkış", command=self.on_close)
-        mb.add_cascade(label="Dosya", menu=m)
-        h = tk.Menu(mb, tearoff=0)
-        h.add_command(label="Nasıl kullanılır?", command=self.show_help)
-        mb.add_cascade(label="Yardım", menu=h)
-        self.config(menu=mb)
-        self.bind("<Control-s>", lambda e: self.save_project())
-        self.bind("<Control-o>", lambda e: self.open_project())
-
     def project_dict(self):
-        return {"version": 1, "tpl_dir": self.v_tpl.get(), "out_dir": self.v_out.get(),
+        return {"version": 1, "mode": self.mode, "tpl_dir": self.v_tpl.get(), "out_dir": self.v_out.get(),
                 "recursive": self.v_rec.get(), "pattern": self.v_pattern.get(),
                 "use_name_col": self.v_usename.get(), "subfolder": self.v_sub.get(),
                 "collision": self.v_coll.get(), "protect": self.v_protect.get(),
@@ -1701,67 +2218,14 @@ class App(tk.Tk):
         else:
             self.refresh_fields()
         self.refresh_table()
-        self.update_title()
-
-    def update_title(self):
-        self.title(f"{APP} – {Path(self.project_file).name}" if self.project_file else APP)
+        self.app.update_title()
 
     def new_project(self):
-        if not messagebox.askyesno(APP, "Klasörler, alan ayarları ve veri tablosu sıfırlansın mı?\n\n"
+        if not messagebox.askyesno(APP, f"'{MODES[self.mode]['title']}' sekmesindeki klasörler, alan ayarları ve "
+                                        f"veri tablosu sıfırlansın mı?\n\n"
                                         "Diskteki şablon ve çıktı dosyalarına dokunulmaz.", icon="warning"):
             return
         self.load_project_dict({})
-
-    def open_project(self):
-        p = filedialog.askopenfilename(title="Proje aç", filetypes=[("SVG Varyant projesi", "*.svgproje"), ("Tümü", "*.*")])
-        if not p:
-            return
-        try:
-            d = json.loads(Path(p).read_text(encoding="utf-8"))
-        except Exception as e:
-            messagebox.showerror(APP, f"Proje okunamadı:\n{e}")
-            return
-        d["project_file"] = p
-        self.load_project_dict(d)
-
-    def save_project(self, ask=False):
-        p = self.project_file
-        if ask or not p:
-            p = filedialog.asksaveasfilename(title="Projeyi kaydet", defaultextension=".svgproje",
-                                             filetypes=[("SVG Varyant projesi", "*.svgproje")])
-            if not p:
-                return
-        self.project_file = p
-        try:
-            Path(p).write_text(json.dumps(self.project_dict(), ensure_ascii=False, indent=1), encoding="utf-8")
-        except OSError as e:
-            messagebox.showerror(APP, f"Kaydedilemedi:\n{e}")
-            return
-        self.update_title()
-        self.status.config(text=f"Proje kaydedildi: {p}")
-
-    def on_close(self):
-        try:
-            sp = session_path()
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            sp.write_text(json.dumps(self.project_dict(), ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-        self.destroy()
-
-    def show_help(self):
-        messagebox.showinfo(APP, (
-            "1) Şablonlarda (.ai, .eps veya .svg) değişecek yazı katmanlarına ALAN_ŞABLON biçiminde isim verin.\n"
-            "    Örn. M.ai içinde NAME_M, NUMBER_M;  XL.ai içinde NAME_XL, NUMBER_XL.\n"
-            "    Dosya adı şablonun (bedenin) adıdır.\n"
-            "    .ai/.eps şablonlar Illustrator ile açılıp düzenlenir; çıktı biçimi (EPS, PDF, AI)\n"
-            "    3. sekmeden seçilir. Bu yüzden bilgisayarda Illustrator kurulu olmalıdır.\n\n"
-            "2) 'Proje ve Analiz' sekmesinde şablon klasörünü seçip 'Analiz Et'e basın.\n"
-            "    Bulunan alanlardan hangilerinin değişken olduğunu işaretleyin.\n\n"
-            "3) 'Veri' sekmesinde tabloyu doldurun: 'Toplu giriş' ile sütun sütun yapıştırarak,\n"
-            "    elle ya da Excel/CSV yükleyerek.\n\n"
-            "4) 'İsimlendirme ve Seçenekler' sekmesinde dosya adı kalıbını ve kuralları belirleyin.\n\n"
-            "5) 'Üret' sekmesinde önce 'Kontrol Et', sonra 'ÜRET'."))
 
     # ---- sekme 1: proje ve analiz ----
     def _tab_project(self):
@@ -1786,6 +2250,8 @@ class App(tk.Tk):
         ttk.Checkbutton(bar, text="Alt klasörleri de tara", variable=self.v_rec).pack(side="left", padx=12)
         self.lbl_tpl = ttk.Label(bar, text="Henüz analiz yapılmadı.", foreground="#555")
         self.lbl_tpl.pack(side="left", padx=8)
+        ttk.Label(g, text=MODE_HINT[self.mode], foreground="#555", wraplength=1050, justify="left").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         f = ttk.LabelFrame(tab, text="Bulunan alanlar (değişken olacakları 'Kullan' sütununa tıklayarak işaretleyin)",
                            padding=8)
@@ -1832,10 +2298,7 @@ class App(tk.Tk):
         ttk.Label(e, foreground="#555", justify="left", text=(
             "Yazı 'Maks. karakter'den uzunsa font boyutu orantılı küçültülür (0 = kapalı). "
             "Örn. sınır 8, yazı 10 harf → font %80. Alt sınır: orijinal boyutun yüzdesi.\n"
-            "Hizalama: .ai/.eps şablonlarda Illustrator'daki paragraf hizası aynen korunur; 'Ortalı'/'Sağa yaslı' "
-            "ayrıca yeni yazıyı örnek yazının ortasına/sağ kenarına oturtur.\n"
-            "SVG şablonlarda Illustrator ortalı yazıyı sola yaslı kaydeder; 'Ortalı' seçilirse yeni yazı örnek "
-            "yazının fonttan ölçülen ortasına göre yerleşir (font bu bilgisayarda kurulu olmalı).")
+            + ALIGN_HINT[self.mode])
                   ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(8, 0))
         for v in self.fv.values():
             v.trace_add("write", self._field_changed)
@@ -1865,7 +2328,7 @@ class App(tk.Tk):
             return
         try:
             self.templates = analyze(folder, self.v_rec.get(), self.v_out.get().strip() or None,
-                                     progress=self.analysis_progress)
+                                     progress=self.analysis_progress, mode=self.mode)
         except Exception as e:
             self.status.config(text="Analiz yapılamadı")
             if not silent:
@@ -1874,19 +2337,18 @@ class App(tk.Tk):
         self.status.config(text="Hazır")
         info = summarize(self.templates)
         old = {f["name"]: f for f in self.fields}
-        self.fields = [old[n] if n in old else new_field(n, d["auto"]) for n, d in info.items()]
+        self.fields = [old[n] if n in old else new_field(n, d["auto"], "center" if self.mode == "pdf" else "left")
+                       for n, d in info.items()]
         self.field_info = info
         stems = [t.stem for t in self.templates]
         if stems:
             self.lbl_tpl.config(text=f"{len(stems)} şablon: {', '.join(stems)}   •   {len(info)} alan bulundu")
         else:
-            self.lbl_tpl.config(text="Bu klasörde AI, EPS ya da SVG şablon bulunamadı.")
+            self.lbl_tpl.config(text=f"Bu klasörde {' / '.join(MODES[self.mode]['exts'])} şablon bulunamadı.")
         self.refresh_fields()
         self.refresh_table()
         if not silent and self.templates and not info:
-            messagebox.showinfo(APP, "Şablonlarda isimlendirilmiş yazı katmanı bulunamadı.\n\n"
-                                     "Değişecek yazı katmanlarına Illustrator'da NAME_M gibi bir isim verip "
-                                     "dosyayı yeniden kaydedin.")
+            messagebox.showinfo(APP, "Şablonlarda değişken alan bulunamadı.\n\n" + MODE_HINT[self.mode])
 
     def analysis_progress(self, k, n, name):
         self.status.config(text=f"Şablonlar okunuyor ({k}/{n}): {name}"
@@ -2177,13 +2639,13 @@ class App(tk.Tk):
                         variable=self.v_sub, command=self.update_name_preview).grid(
             row=5, column=0, columnspan=3, sticky="w")
 
-        o = ttk.LabelFrame(tab, text="Çıktı biçimi (.ai / .eps şablonlar için; .svg şablonlardan SVG üretilir)",
-                           padding=8)
-        o.pack(fill="x", pady=(10, 0))
-        for k, v in OUT_FORMATS.items():
-            ttk.Radiobutton(o, text=v, variable=self.v_fmt, value=k).pack(side="left", padx=(0, 18))
-        ttk.Label(o, foreground="#555", text="EPS: fontlar gömülür.  PDF: Illustrator'da düzenlenebilir kalır."
-                  ).pack(side="left", padx=(12, 0))
+        if self.mode == "eps":
+            o = ttk.LabelFrame(tab, text="Çıktı biçimi", padding=8)
+            o.pack(fill="x", pady=(10, 0))
+            for k, v in OUT_FORMATS.items():
+                ttk.Radiobutton(o, text=v, variable=self.v_fmt, value=k).pack(side="left", padx=(0, 18))
+            ttk.Label(o, foreground="#555", text="EPS: fontlar gömülür.  PDF: Illustrator'da düzenlenebilir kalır."
+                      ).pack(side="left", padx=(12, 0))
 
         c = ttk.LabelFrame(tab, text="Çıktı klasöründe aynı isimde dosya varsa", padding=8)
         c.pack(fill="x", pady=(10, 0))
@@ -2225,8 +2687,7 @@ class App(tk.Tk):
             parts, unknown = name_parts(self.v_pattern.get(), row, 1, tname)
         if self.v_sub.get() and tname:
             parts = [clean_part(tname)] + parts
-        sample = t or (self.templates[0] if self.templates else None)
-        ext = sample.out_ext(self.options()) if sample else "." + self.v_fmt.get()
+        ext = {"svg": ".svg", "pdf": ".pdf"}.get(self.mode, "." + self.v_fmt.get())
         self.lbl_ext.config(text=ext)
         txt = "\\".join(parts or ["satir_1"]) + ext
         if unknown:
@@ -2309,7 +2770,7 @@ class App(tk.Tk):
         # Şablonlar diskte değişmiş olabilir; üretimden önce yeniden oku.
         try:
             self.templates = analyze(self.v_tpl.get().strip(), self.v_rec.get(), out,
-                                     progress=self.analysis_progress)
+                                     progress=self.analysis_progress, mode=self.mode)
         except Exception as e:
             messagebox.showerror(APP, f"Şablonlar okunamadı:\n{e}")
             return
@@ -2350,7 +2811,7 @@ class App(tk.Tk):
             return
         sel = self.tree.selection()
         row = self.rows[int(sel[0])] if sel else self.rows[0]
-        tmp = Path(tempfile.gettempdir()) / "svg-varyant-onizleme"
+        tmp = Path(tempfile.gettempdir()) / "grafik-varyant-onizleme" / self.mode
         opts = dict(self.options(str(tmp)), collision="overwrite", protect=False, subfolder=False)
         rep = generate(opts, self.templates, self.fields, [row])
         if rep["done"]:
