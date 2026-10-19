@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SVG Varyant Üretici
 
-Şablon SVG dosyalarındaki isimlendirilmiş yazı katmanlarını (ör. NAME_S, NUMBER_M)
-bir tablodaki verilerle doldurup her satır için ayrı SVG üretir.
+Şablon dosyalarındaki (.ai / .eps Illustrator ile, .svg doğrudan) isimlendirilmiş yazı katmanlarını
+(ör. NAME_S, NUMBER_M) bir tablodaki verilerle doldurup her satır için ayrı dosya üretir.
 """
 import csv
 import datetime
@@ -340,6 +340,32 @@ def font_missing(family_css, text):
     return ("missing" if missing else "ok"), missing, shown
 
 
+def font_checks(fname, family, val):
+    """Elle kontrol gerektiren font sorunları (yazıda fontta olmayan harf)."""
+    if not val:
+        return []
+    state, miss, shown = font_missing(family, val)
+    if state == "missing":
+        return [f"{fname}: '{shown}' fontunda olmayan karakter: {' '.join(miss)}"]
+    if state == "nofont" and any(ord(ch) > 127 for ch in val):
+        return [f"{fname}: '{shown}' fontu bu bilgisayarda bulunamadı, özel karakterler denetlenemedi: "
+                f"{' '.join(dict.fromkeys(ch for ch in val if ord(ch) > 127))}"]
+    return []
+
+
+def field_limits(cfg):
+    """(maks. karakter, en küçük font yüzdesi)"""
+    try:
+        mx = int(cfg.get("max") or 0)
+    except (TypeError, ValueError):
+        mx = 0
+    try:
+        minpct = float(cfg.get("minpct") or 0)
+    except (TypeError, ValueError):
+        minpct = 0
+    return mx, minpct
+
+
 def set_attr(tag, name, val):
     """Bir açılış etiketinde özelliği yazar (varsa değiştirir)."""
     m = re.search(r"(?<![\w:\-])%s\s*=\s*(?:\"[^\"]*\"|'[^']*')" % re.escape(name), tag)
@@ -418,6 +444,8 @@ def split_field(label, stem):
 
 
 class Template:
+    kind = "svg"
+
     def __init__(self, path):
         self.path = Path(path)
         self.stem = self.path.stem
@@ -490,14 +518,7 @@ class Template:
                 continue
             val = values[fname]
             cfg = cfgs.get(fname, {})
-            try:
-                mx = int(cfg.get("max") or 0)
-            except (TypeError, ValueError):
-                mx = 0
-            try:
-                minpct = float(cfg.get("minpct") or 0)
-            except (TypeError, ValueError):
-                minpct = 0
+            mx, minpct = field_limits(cfg)
             for n in nodes:
                 open_tag = self.src[n["open_start"]:n["open_end"]]
                 inner = self.src[n["open_end"]:n["inner_end"]]
@@ -505,14 +526,7 @@ class Template:
                 ts_tag = tm.group(0) if tm else None
                 if ts_tag and ts_tag.endswith("/>"):
                     ts_tag = ts_tag[:-2].rstrip() + ">"
-                if val:
-                    state, miss, shown = font_missing(n["family"], val)
-                    if state == "missing":
-                        checks.append(f"{fname}: '{shown}' fontunda olmayan karakter: {' '.join(miss)}")
-                    elif state == "nofont" and any(ord(ch) > 127 for ch in val):
-                        checks.append(f"{fname}: '{shown}' fontu bu bilgisayarda bulunamadı, "
-                                      f"özel karakterler denetlenemedi: "
-                                      f"{' '.join(dict.fromkeys(ch for ch in val if ord(ch) > 127))}")
+                checks += font_checks(fname, n["family"], val)
                 if mx > 0 and len(val) > mx:
                     checks.append(f"{fname}: uzun yazı ({len(val)} karakter, sınır {mx})")
                     base = find_font_size(ts_tag, self.css) if ts_tag else None
@@ -556,15 +570,299 @@ class Template:
         # Dosyanın kodlamasında olmayan harfler (ör. iso-8859-1'de ı, ş, ğ) &#305; biçiminde yazılır.
         return out.encode(self.enc, errors="xmlcharrefreplace"), notes, list(dict.fromkeys(checks))
 
+    def out_ext(self, opts):
+        return ".svg"
 
-def analyze(folder, recursive=False, exclude=None):
+    def write(self, data, target, opts):
+        target.write_bytes(data)
+
+
+# ----------------------------------------------------------------------------
+# Çekirdek: Illustrator (.ai / .eps şablonlar)
+# ----------------------------------------------------------------------------
+# .ai/.eps şablonlar Illustrator'ın kendisiyle açılıp değiştirilir (COM + ExtendScript). Böylece paragraf
+# hizası, kerning, font ve efektler Illustrator'da nasılsa öyle kalır; çıktı EPS, PDF ya da AI kaydedilir.
+
+AI_EXTS = (".ai", ".eps")
+OUT_FORMATS = {"eps": "EPS", "pdf": "PDF", "ai": "AI"}
+
+AI_JS = r"""
+function ser(v){
+ if(v===null||v===undefined) return "null";
+ var t=typeof v;
+ if(t=="number") return isFinite(v)?String(v):"null";
+ if(t=="boolean") return v?"true":"false";
+ if(t=="string"){var s='"';for(var i=0;i<v.length;i++){var c=v.charAt(i),k=v.charCodeAt(i);
+  if(c=='"'||c=='\\') s+='\\'+c; else if(k<32) s+='\\u'+('000'+k.toString(16)).slice(-4); else s+=c;}
+  return s+'"';}
+ if(v instanceof Array){var a=[];for(var j=0;j<v.length;j++) a.push(ser(v[j]));return "["+a.join(",")+"]";}
+ var o=[];for(var key in v) if(v.hasOwnProperty(key)) o.push(ser(key)+":"+ser(v[key]));return "{"+o.join(",")+"}";
+}
+function samePath(a,b){return a.replace(/\//g,"\\").toLowerCase()==b.replace(/\//g,"\\").toLowerCase();}
+function findDoc(p){
+ for(var i=0;i<app.documents.length;i++){try{if(samePath(app.documents[i].fullName.fsName,p)) return app.documents[i];}catch(e){}}
+ return null;
+}
+function frameLabel(tf){
+ if(tf.name) return [tf.name,true];
+ try{var p=tf.parent;
+  if(p.typename=="GroupItem"&&p.pageItems.length==1&&p.name) return [p.name,false];
+  if(p.typename=="Layer"&&p.pageItems.length==1&&p.layers.length==0) return [p.name,false];
+ }catch(e){}
+ return ["",false];
+}
+function bounds(tf){var b=tf.geometricBounds;return [b[0],b[1],b[2],b[3]];}
+function analyzeDoc(doc){
+ var out=[];
+ for(var i=0;i<doc.textFrames.length;i++){
+  var tf=doc.textFrames[i],lb=frameLabel(tf);
+  if(!lb[0]) continue;
+  var r={i:i,label:lb[0],own:lb[1],text:tf.contents,family:"",ps:"",size:0,just:"",
+         kind:String(tf.kind).replace("TextType.",""),bounds:bounds(tf)};
+  try{var ca=tf.textRange.characters[0].characterAttributes;r.size=ca.size;r.family=ca.textFont.family;r.ps=ca.textFont.name;}catch(e){}
+  try{r.just=String(tf.paragraphs[0].paragraphAttributes.justification).replace("Justification.","");}catch(e){}
+  out.push(r);
+ }
+ return out;
+}
+function setText(tf,e){
+ var undo=[],x=tf;
+ while(x&&x.typename!="Document"){try{if(x.locked){x.locked=false;undo.push(x);}}catch(er){} x=x.parent;}
+ try{
+  tf.contents=e.text;
+  if(e.size>0&&e.text.length) tf.textRange.characterAttributes.size=e.size;
+  if(e.kind=="POINTTEXT"&&e.text.length&&(e.align=="center"||e.align=="right")){
+   var b=tf.geometricBounds,o=e.bounds;
+   tf.translate(e.align=="center"?(o[0]+o[2])/2-(b[0]+b[2])/2:o[2]-b[2],0);
+  }
+ }finally{for(var k=0;k<undo.length;k++) undo[k].locked=true;}
+}
+function saveDoc(d,path,fmt){
+ var f=new File(path),o;
+ if(fmt=="pdf"){o=new PDFSaveOptions();o.preserveEditability=true;}
+ else if(fmt=="ai"){o=new IllustratorSaveOptions();o.embedICCProfile=true;}
+ else{o=new EPSSaveOptions();o.embedAllFonts=true;o.embedLinkedFiles=true;o.saveMultipleArtboards=false;}
+ d.saveAs(f,o);
+}
+"""
+
+AI_ANALYZE = r"""
+var d=findDoc(DATA.path),mine=!d;
+if(mine) d=app.open(new File(DATA.path));
+try{return ser({frames:analyzeDoc(d)});}finally{if(mine) d.close(SaveOptions.DONOTSAVECHANGES);}
+"""
+
+AI_WRITE = r"""
+var d=DATA.cur?findDoc(DATA.cur):null;
+if(!d){
+ if(findDoc(DATA.tpl)) throw new Error("Şablon Illustrator'da açık, kapatıp yeniden deneyin: "+DATA.tpl);
+ d=app.open(new File(DATA.tpl));
+}
+for(var n=0;n<DATA.edits.length;n++){
+ var e=DATA.edits[n];
+ if(e.i>=d.textFrames.length||frameLabel(d.textFrames[e.i])[0]!=e.label)
+  throw new Error("Şablon analizden sonra değişmiş, yeniden analiz edin ("+e.label+")");
+ setText(d.textFrames[e.i],e);
+}
+saveDoc(d,DATA.out,DATA.fmt);
+return ser({cur:d.fullName.fsName});
+"""
+
+AI_CLOSE = r"""
+for(var n=0;n<DATA.paths.length;n++){var d=findDoc(DATA.paths[n]);if(d) d.close(SaveOptions.DONOTSAVECHANGES);}
+return ser({});
+"""
+
+
+class IllustratorError(Exception):
+    pass
+
+
+class Illustrator:
+    """Açık Illustrator'a COM ile bağlanır (gerekirse başlatır), ExtendScript çalıştırır.
+    Üretimde şablon her satırda yeniden açılmaz: belge açık tutulur, farklı kaydet ile yeni dosyalar yazılır.
+    Orijinal şablon hiç kaydedilmez."""
+
+    def __init__(self):
+        self.app = None
+        self.docs = {}  # şablon yolu -> {"cur": açık belgenin şu anki yolu, "dirty": {çerçeve: geri alma düzenlemesi}}
+
+    def call(self, body, **data):
+        if self.app is None:
+            try:
+                import win32com.client
+            except ImportError:
+                raise IllustratorError(".ai/.eps şablonlar için pywin32 gerekli.\n\nKomut satırında:  pip install pywin32")
+            try:
+                self.app = win32com.client.Dispatch("Illustrator.Application")
+            except Exception as e:
+                raise IllustratorError(f"Illustrator'a bağlanılamadı (kurulu mu?): {e}")
+        script = (AI_JS + "var DATA=" + json.dumps(data) + ";\n(function(){\n"
+                  "var __ui=app.userInteractionLevel;app.userInteractionLevel=UserInteractionLevel.DONTDISPLAYALERTS;\n"
+                  "try{" + body + "}catch(e){return ser({error:String(e.message||e)+(e.line?' (satır '+e.line+')':'')});}\n"
+                  "finally{app.userInteractionLevel=__ui;}\n})();")
+        try:
+            res = self.app.DoJavaScript(script)
+        except Exception as e:
+            self.app = None  # Illustrator kapatılmış olabilir; sonraki çağrı yeniden bağlansın
+            raise IllustratorError(f"Illustrator komutu çalışmadı: {e}")
+        try:
+            out = json.loads(res or "null")
+        except ValueError:
+            raise IllustratorError(f"Illustrator'dan beklenmeyen yanıt: {str(res)[:200]}")
+        if isinstance(out, dict) and out.get("error"):
+            raise IllustratorError(out["error"])
+        return out
+
+    def close_all(self):
+        paths = [s["cur"] for s in self.docs.values() if s["cur"]]
+        self.docs.clear()
+        if paths:
+            self.call(AI_CLOSE, paths=paths)
+
+
+_illustrator = None
+_ai_cache = None
+
+
+def illustrator():
+    global _illustrator
+    if _illustrator is None:
+        _illustrator = Illustrator()
+    return _illustrator
+
+
+def ai_cache_path():
+    return session_path().with_name("svg-varyant-ai-onbellek.json")
+
+
+def ai_frames(path):
+    """Şablondaki isimli yazı çerçeveleri. Illustrator'da açmak yavaş olduğu için sonuç, dosya değişene kadar
+    saklanır; böylece program açılışında ve kontrolde Illustrator gerekmez."""
+    global _ai_cache
+    if _ai_cache is None:
+        try:
+            _ai_cache = json.loads(ai_cache_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _ai_cache = {}
+    st = path.stat()
+    key, sig = str(path.resolve()).lower(), [st.st_mtime_ns, st.st_size]
+    hit = _ai_cache.get(key)
+    if hit and hit.get("sig") == sig:
+        return hit["frames"]
+    frames = illustrator().call(AI_ANALYZE, path=str(path.resolve()))["frames"]
+    _ai_cache[key] = {"sig": sig, "frames": frames}
+    try:
+        ai_cache_path().parent.mkdir(parents=True, exist_ok=True)
+        ai_cache_path().write_text(json.dumps(_ai_cache, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    return frames
+
+
+class AiTemplate:
+    kind = "ai"
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.stem = self.path.stem
+        self.fields = {}
+        self.nodes = {}
+        for fr in ai_frames(self.path):
+            field, stripped = split_field(fr["label"].strip(), self.stem)
+            pt = float(fr.get("size") or 0)
+            n = dict(fr, stripped=stripped, pt=pt,
+                     family=", ".join(x for x in (fr.get("ps"), fr.get("family")) if x),
+                     sample=re.sub(r"\s+", " ", fr.get("text", "")).strip(),
+                     size=f"{fmt_num(pt)}pt" if pt else "")
+            self.fields.setdefault(field, []).append(n)
+            self.nodes[n["i"]] = n
+
+    @staticmethod
+    def _edit(n, text, size, align):
+        return {"i": n["i"], "label": n["label"], "text": text.replace("\r\n", "\r").replace("\n", "\r"),
+                "size": size, "align": align, "kind": n["kind"], "bounds": n["bounds"]}
+
+    def render(self, values, cfgs):
+        """(çerçeve düzenlemeleri, küçültme notları, elle kontrol gerektiren nedenler)"""
+        edits, notes, checks = {}, [], []
+        for fname, nodes in self.fields.items():
+            if fname not in values:
+                continue
+            val = values[fname]
+            cfg = cfgs.get(fname, {})
+            mx, minpct = field_limits(cfg)
+            for n in nodes:
+                checks += font_checks(fname, n["family"], val)
+                size = n["pt"]
+                if mx > 0 and len(val) > mx:
+                    checks.append(f"{fname}: uzun yazı ({len(val)} karakter, sınır {mx})")
+                    if not size:
+                        notes.append(f"{fname}: {len(val)} karakter (sınır {mx}) ama font boyutu "
+                                     f"şablonda okunamadı, küçültülemedi.")
+                    else:
+                        floor = minpct / 100.0
+                        ratio = mx / len(val)
+                        size = n["pt"] * max(ratio, floor)
+                        notes.append(f"{fname}: {len(val)} karakter (sınır {mx}) → font {fmt_num(n['pt'])}pt → "
+                                     f"{fmt_num(size)}pt" + (" (alt sınıra takıldı, taşabilir)" if ratio < floor else ""))
+                edits[n["i"]] = self._edit(n, val, size, cfg.get("align", "left"))
+        return edits, notes, list(dict.fromkeys(checks))
+
+    def out_ext(self, opts):
+        return "." + (opts.get("fmt") or "eps")
+
+    def write(self, edits, target, opts):
+        ill = illustrator()
+        key = str(self.path.resolve()).lower()
+        state = ill.docs.setdefault(key, {"cur": None, "dirty": {}})
+        # Belge önceki satırlardan açık kaldığı için, o satırlarda değişip bu satırda yazılmayan
+        # çerçeveler şablondaki haline döndürülür.
+        jobs = list(edits.values()) + [e for i, e in state["dirty"].items() if i not in edits]
+        try:
+            res = ill.call(AI_WRITE, tpl=str(self.path.resolve()), cur=state["cur"], out=str(target.resolve()),
+                           fmt=opts.get("fmt") or "eps", edits=jobs)
+        except IllustratorError:
+            # Belgenin hangi durumda kaldığı belli değil; kapatılsın, sonraki satır şablonu yeniden açsın.
+            cur = state["cur"]
+            del ill.docs[key]
+            if cur:
+                try:
+                    ill.call(AI_CLOSE, paths=[cur])
+                except IllustratorError:
+                    pass
+            raise
+        state["cur"] = res["cur"]
+        state["dirty"] = {i: self._edit(self.nodes[i], self.nodes[i]["text"], self.nodes[i]["pt"], e["align"])
+                          for i, e in edits.items()}
+
+
+TEMPLATE_EXTS = (".svg",) + AI_EXTS
+
+
+def analyze(folder, recursive=False, exclude=None, progress=None):
     folder = Path(folder)
-    paths = sorted(folder.rglob("*.svg") if recursive else folder.glob("*.svg"), key=lambda p: str(p).lower())
+    found = folder.rglob("*") if recursive else folder.glob("*")
+    paths = sorted((p for p in found if p.suffix.lower() in TEMPLATE_EXTS and p.is_file()),
+                   key=lambda p: str(p).lower())
     if exclude:
         ex = Path(exclude).resolve()
         if ex != folder.resolve():
             paths = [p for p in paths if ex not in p.resolve().parents]
-    return [Template(p) for p in paths]
+    # Aynı adlı şablon birden fazla biçimde varsa (M.ai ve M.svg) Illustrator dosyası kullanılır.
+    rank = {".ai": 0, ".eps": 1, ".svg": 2}
+    best = {}
+    for p in paths:
+        k = (str(p.parent).lower(), p.stem.lower())
+        if k not in best or rank[p.suffix.lower()] < rank[best[k].suffix.lower()]:
+            best[k] = p
+    paths = [p for p in paths if best[(str(p.parent).lower(), p.stem.lower())] is p]
+    out = []
+    for k, p in enumerate(paths, 1):
+        if progress:
+            progress(k, len(paths), p.name)
+        out.append(AiTemplate(p) if p.suffix.lower() in AI_EXTS else Template(p))
+    return out
 
 
 def summarize(templates):
@@ -667,7 +965,21 @@ def row_label(row, active, idx):
     return f"satır {idx}"
 
 
+OUT_EXT_RE = re.compile(r"\.(svg|eps|pdf|ai)$", re.I)
+
+
 def generate(opts, templates, fields, rows, dry=False, progress=None):
+    try:
+        return _generate(opts, templates, fields, rows, dry, progress)
+    finally:
+        if _illustrator is not None and _illustrator.docs:
+            try:
+                _illustrator.close_all()
+            except IllustratorError:
+                pass
+
+
+def _generate(opts, templates, fields, rows, dry, progress):
     rep = {"done": [], "missing": [], "skipped": [], "warn": [], "shrink": [], "errors": [], "dry": dry,
            "check": [], "check_dir": bool(opts.get("check_dir")),
            "total": 0}
@@ -706,7 +1018,7 @@ def generate(opts, templates, fields, rows, dry=False, progress=None):
                 rep["warn"].append(f"Satır {i} ({label}): {nm} boş yazıldı.")
             values[nm] = val
         try:
-            data, notes, checks = t.render(values, cfgs)
+            job, notes, checks = t.render(values, cfgs)
         except Exception as e:  # tek bir bozuk şablon tüm işi durdurmasın
             rep["errors"].append(f"Satır {i} ({label}): şablon işlenemedi: {e}")
             continue
@@ -715,7 +1027,7 @@ def generate(opts, templates, fields, rows, dry=False, progress=None):
 
         custom = str(row.get(COL_F, "") or "").strip()
         if opts.get("use_name_col", True) and custom:
-            custom = re.sub(r"\.svg$", "", custom, flags=re.I)
+            custom = OUT_EXT_RE.sub("", custom)
             parts = [p for p in (clean_part(x) for x in re.split(r"[/\\]+", custom)) if p]
         else:
             parts, unknown = name_parts(opts.get("pattern", ""), row, i, t.stem)
@@ -729,11 +1041,12 @@ def generate(opts, templates, fields, rows, dry=False, progress=None):
             parts = [CHECK_DIR] + parts
         folder = out.joinpath(*parts[:-1])
         stem = parts[-1]
-        target = folder / (stem + ".svg")
+        ext = t.out_ext(opts)
+        target = folder / (stem + ext)
 
         n = 2
         while str(target.resolve()).lower() in used:
-            target = folder / f"{stem}_{n}.svg"
+            target = folder / f"{stem}_{n}{ext}"
             n += 1
         if n > 2:
             rep["warn"].append(f"Satır {i} ({label}): aynı dosya adı bu listede birden fazla, "
@@ -750,15 +1063,15 @@ def generate(opts, templates, fields, rows, dry=False, progress=None):
                 continue
             if mode == "number":
                 while target.exists() or str(target.resolve()).lower() in used:
-                    target = folder / f"{stem}_{n}.svg"
+                    target = folder / f"{stem}_{n}{ext}"
                     n += 1
                 key = str(target.resolve()).lower()
         used.add(key)
         if not dry:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-            except OSError as e:
+                t.write(job, target, opts)
+            except (OSError, IllustratorError) as e:
                 rep["errors"].append(f"Satır {i} ({label}): yazılamadı: {e}")
                 continue
         rep["done"].append((i, t.stem, label, str(target)))
@@ -1312,6 +1625,7 @@ class App(tk.Tk):
         self.v_savereport = tk.BooleanVar(value=True)
         self.v_openafter = tk.BooleanVar(value=False)
         self.v_checkdir = tk.BooleanVar(value=True)
+        self.v_fmt = tk.StringVar(value="eps")
 
         self._menu()
         self.nb = ttk.Notebook(self)
@@ -1324,6 +1638,7 @@ class App(tk.Tk):
         self.status.pack(fill="x", side="bottom")
 
         self.v_pattern.trace_add("write", lambda *a: self.update_name_preview())
+        self.v_fmt.trace_add("write", lambda *a: self.update_name_preview())
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         if load_session:
             sp = session_path()
@@ -1358,7 +1673,7 @@ class App(tk.Tk):
                 "use_name_col": self.v_usename.get(), "subfolder": self.v_sub.get(),
                 "collision": self.v_coll.get(), "protect": self.v_protect.get(),
                 "save_report": self.v_savereport.get(), "open_after": self.v_openafter.get(),
-                "check_dir": self.v_checkdir.get(),
+                "check_dir": self.v_checkdir.get(), "out_fmt": self.v_fmt.get(),
                 "fields": self.fields, "rows": self.rows, "project_file": self.project_file}
 
     def load_project_dict(self, d):
@@ -1373,6 +1688,7 @@ class App(tk.Tk):
         self.v_savereport.set(d.get("save_report", True))
         self.v_openafter.set(bool(d.get("open_after")))
         self.v_checkdir.set(d.get("check_dir", True))
+        self.v_fmt.set(d.get("out_fmt") if d.get("out_fmt") in OUT_FORMATS else "eps")
         self.fields = [dict(new_field(f.get("name", "")), **f) for f in d.get("fields", []) if f.get("name")]
         self.rows = [dict(r) for r in d.get("rows", []) if isinstance(r, dict)]
         for r in self.rows:  # eski projelerde sütunun adı "Şablon"du
@@ -1435,9 +1751,11 @@ class App(tk.Tk):
 
     def show_help(self):
         messagebox.showinfo(APP, (
-            "1) Şablon SVG'lerinde değişecek yazı katmanlarına ALAN_ŞABLON biçiminde isim verin.\n"
-            "    Örn. M.svg içinde NAME_M, NUMBER_M;  XL.svg içinde NAME_XL, NUMBER_XL.\n"
-            "    Dosya adı şablonun (bedenin) adıdır.\n\n"
+            "1) Şablonlarda (.ai, .eps veya .svg) değişecek yazı katmanlarına ALAN_ŞABLON biçiminde isim verin.\n"
+            "    Örn. M.ai içinde NAME_M, NUMBER_M;  XL.ai içinde NAME_XL, NUMBER_XL.\n"
+            "    Dosya adı şablonun (bedenin) adıdır.\n"
+            "    .ai/.eps şablonlar Illustrator ile açılıp düzenlenir; çıktı biçimi (EPS, PDF, AI)\n"
+            "    3. sekmeden seçilir. Bu yüzden bilgisayarda Illustrator kurulu olmalıdır.\n\n"
             "2) 'Proje ve Analiz' sekmesinde şablon klasörünü seçip 'Analiz Et'e basın.\n"
             "    Bulunan alanlardan hangilerinin değişken olduğunu işaretleyin.\n\n"
             "3) 'Veri' sekmesinde tabloyu doldurun: 'Toplu giriş' ile sütun sütun yapıştırarak,\n"
@@ -1514,8 +1832,10 @@ class App(tk.Tk):
         ttk.Label(e, foreground="#555", justify="left", text=(
             "Yazı 'Maks. karakter'den uzunsa font boyutu orantılı küçültülür (0 = kapalı). "
             "Örn. sınır 8, yazı 10 harf → font %80. Alt sınır: orijinal boyutun yüzdesi.\n"
-            "Hizalama: Illustrator ortalı yazıyı SVG'ye sola yaslı kaydeder. 'Ortalı' seçerseniz yeni yazı, "
-            "şablondaki örnek yazının ortasına göre yerleşir (font bu bilgisayarda kurulu olmalı).")
+            "Hizalama: .ai/.eps şablonlarda Illustrator'daki paragraf hizası aynen korunur; 'Ortalı'/'Sağa yaslı' "
+            "ayrıca yeni yazıyı örnek yazının ortasına/sağ kenarına oturtur.\n"
+            "SVG şablonlarda Illustrator ortalı yazıyı sola yaslı kaydeder; 'Ortalı' seçilirse yeni yazı örnek "
+            "yazının fonttan ölçülen ortasına göre yerleşir (font bu bilgisayarda kurulu olmalı).")
                   ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(8, 0))
         for v in self.fv.values():
             v.trace_add("write", self._field_changed)
@@ -1544,11 +1864,14 @@ class App(tk.Tk):
                 messagebox.showwarning(APP, "Geçerli bir şablon klasörü seçin.")
             return
         try:
-            self.templates = analyze(folder, self.v_rec.get(), self.v_out.get().strip() or None)
+            self.templates = analyze(folder, self.v_rec.get(), self.v_out.get().strip() or None,
+                                     progress=self.analysis_progress)
         except Exception as e:
+            self.status.config(text="Analiz yapılamadı")
             if not silent:
                 messagebox.showerror(APP, f"Analiz hatası:\n{e}")
             return
+        self.status.config(text="Hazır")
         info = summarize(self.templates)
         old = {f["name"]: f for f in self.fields}
         self.fields = [old[n] if n in old else new_field(n, d["auto"]) for n, d in info.items()]
@@ -1557,13 +1880,19 @@ class App(tk.Tk):
         if stems:
             self.lbl_tpl.config(text=f"{len(stems)} şablon: {', '.join(stems)}   •   {len(info)} alan bulundu")
         else:
-            self.lbl_tpl.config(text="Bu klasörde SVG bulunamadı.")
+            self.lbl_tpl.config(text="Bu klasörde AI, EPS ya da SVG şablon bulunamadı.")
         self.refresh_fields()
         self.refresh_table()
         if not silent and self.templates and not info:
-            messagebox.showinfo(APP, "SVG'lerde isimlendirilmiş yazı katmanı bulunamadı.\n\n"
+            messagebox.showinfo(APP, "Şablonlarda isimlendirilmiş yazı katmanı bulunamadı.\n\n"
                                      "Değişecek yazı katmanlarına Illustrator'da NAME_M gibi bir isim verip "
-                                     "SVG'yi yeniden kaydedin.")
+                                     "dosyayı yeniden kaydedin.")
+
+    def analysis_progress(self, k, n, name):
+        self.status.config(text=f"Şablonlar okunuyor ({k}/{n}): {name}"
+                                + ("  –  Illustrator ile açılıyor, biraz sürebilir"
+                                   if name.lower().endswith(AI_EXTS) else ""))
+        self.update_idletasks()
 
     def _field_row(self, f):
         info = getattr(self, "field_info", {}).get(f["name"], {"files": [], "sample": "", "size": "", "tr": ""})
@@ -1830,7 +2159,8 @@ class App(tk.Tk):
         ttk.Label(g, text="Dosya adı kalıbı:").grid(row=0, column=0, sticky="w")
         self.ent_pattern = ttk.Entry(g, textvariable=self.v_pattern, font=("Consolas", 11))
         self.ent_pattern.grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Label(g, text=".svg").grid(row=0, column=2, sticky="w")
+        self.lbl_ext = ttk.Label(g, text=".eps", width=5)
+        self.lbl_ext.grid(row=0, column=2, sticky="w")
         ttk.Label(g, text="Alan ekle:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.pbar = ttk.Frame(g)
         self.pbar.grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=(6, 0))
@@ -1846,6 +2176,14 @@ class App(tk.Tk):
         ttk.Checkbutton(g, text="Her şablon için ayrı alt klasör aç (export/M/…, export/XL/…)",
                         variable=self.v_sub, command=self.update_name_preview).grid(
             row=5, column=0, columnspan=3, sticky="w")
+
+        o = ttk.LabelFrame(tab, text="Çıktı biçimi (.ai / .eps şablonlar için; .svg şablonlardan SVG üretilir)",
+                           padding=8)
+        o.pack(fill="x", pady=(10, 0))
+        for k, v in OUT_FORMATS.items():
+            ttk.Radiobutton(o, text=v, variable=self.v_fmt, value=k).pack(side="left", padx=(0, 18))
+        ttk.Label(o, foreground="#555", text="EPS: fontlar gömülür.  PDF: Illustrator'da düzenlenebilir kalır."
+                  ).pack(side="left", padx=(12, 0))
 
         c = ttk.LabelFrame(tab, text="Çıktı klasöründe aynı isimde dosya varsa", padding=8)
         c.pack(fill="x", pady=(10, 0))
@@ -1882,12 +2220,15 @@ class App(tk.Tk):
         tname = t.stem if t else str(row.get(COL_T, "") or "")
         custom = str(row.get(COL_F, "") or "").strip()
         if self.v_usename.get() and custom:
-            parts, unknown = [clean_part(re.sub(r"\.svg$", "", custom, flags=re.I))], []
+            parts, unknown = [clean_part(OUT_EXT_RE.sub("", custom))], []
         else:
             parts, unknown = name_parts(self.v_pattern.get(), row, 1, tname)
         if self.v_sub.get() and tname:
             parts = [clean_part(tname)] + parts
-        txt = "\\".join(parts or ["satir_1"]) + ".svg"
+        sample = t or (self.templates[0] if self.templates else None)
+        ext = sample.out_ext(self.options()) if sample else "." + self.v_fmt.get()
+        self.lbl_ext.config(text=ext)
+        txt = "\\".join(parts or ["satir_1"]) + ext
         if unknown:
             txt += "     ⚠ bilinmeyen alan: " + ", ".join("{" + u + "}" for u in unknown)
         self.lbl_preview.config(text=txt)
@@ -1925,7 +2266,7 @@ class App(tk.Tk):
     def options(self, out_dir=None):
         return {"out_dir": out_dir or self.v_out.get().strip(), "pattern": self.v_pattern.get(),
                 "use_name_col": self.v_usename.get(), "subfolder": self.v_sub.get(),
-                "collision": self.v_coll.get(), "protect": self.v_protect.get()}
+                "collision": self.v_coll.get(), "protect": self.v_protect.get(), "fmt": self.v_fmt.get()}
 
     def preflight(self):
         self._close_editor()
@@ -1967,7 +2308,8 @@ class App(tk.Tk):
 
         # Şablonlar diskte değişmiş olabilir; üretimden önce yeniden oku.
         try:
-            self.templates = analyze(self.v_tpl.get().strip(), self.v_rec.get(), out)
+            self.templates = analyze(self.v_tpl.get().strip(), self.v_rec.get(), out,
+                                     progress=self.analysis_progress)
         except Exception as e:
             messagebox.showerror(APP, f"Şablonlar okunamadı:\n{e}")
             return

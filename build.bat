@@ -1,6 +1,6 @@
 @echo off
 rem Tek dosyalik tasinabilir exe uretir: dist\SVG-Varyant-Uretici.exe
-python -m pip install --upgrade pyinstaller openpyxl || exit /b 1
-python -m PyInstaller --noconfirm --clean --onefile --windowed --icon assets\app.ico --add-data "assets\app.ico;assets"--exclude-module numpy --exclude-module pandas --exclude-module PIL --exclude-module lxml --exclude-module matplotlib --exclude-module scipy --name SVG-Varyant-Uretici svg_varyant.pyw || exit /b 1
+python -m pip install --upgrade pyinstaller openpyxl pywin32 || exit /b 1
+python -m PyInstaller --noconfirm --clean --onefile --windowed --icon assets\app.ico --add-data "assets\app.ico;assets" --exclude-module numpy --exclude-module pandas --exclude-module PIL --exclude-module lxml --exclude-module matplotlib --exclude-module scipy --name SVG-Varyant-Uretici svg_varyant.pyw || exit /b 1
 echo.
 echo Hazir: dist\SVG-Varyant-Uretici.exe
