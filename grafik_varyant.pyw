@@ -584,7 +584,8 @@ class Template:
 # hizası, kerning, font ve efektler Illustrator'da nasılsa öyle kalır; çıktı EPS, PDF ya da AI kaydedilir.
 
 AI_EXTS = (".ai", ".eps")
-OUT_FORMATS = {"eps": "EPS", "pdf": "PDF", "ai": "AI"}
+OUT_FORMATS = {"eps": "EPS", "pdf": "PDF", "ai": "AI", "tif": "TIFF"}
+TIF_COLORS = {"cmyk": "CMYK", "rgb": "RGB"}
 
 AI_JS = r"""
 function ser(v){
@@ -639,6 +640,20 @@ function setText(tf,e){
 }
 function saveDoc(d,path,fmt){
  var f=new File(path),o;
+ if(fmt=="tif"){
+  // Dışa aktarma belgenin yolunu değiştirmez; belge şablon yolunda açık kalır, ama hiç kaydedilmez.
+  // Çalışma yüzeyiyle kırpmak için çalışma yüzeyi aralığı verilir; Illustrator bu durumda dosya adına
+  // "-01" gibi bir ek koyar. Bu yüzden geçici adla yazılır, Python asıl ada taşır.
+  o=new ExportOptionsTIFF();o.resolution=DATA.dpi;o.lZWCompression=true;
+  o.saveMultipleArtboards=true;o.artboardRange=String(d.artboards.getActiveArtboardIndex()+1);
+  o.antiAliasing=AntiAliasingMethod.ARTOPTIMIZED;
+  o.imageColorSpace=DATA.color=="rgb"?ImageColorSpace.RGB:ImageColorSpace.CMYK;
+  var base="__gv_tmp_"+(new Date().getTime());
+  d.exportFile(new File(f.parent.fsName+"/"+base+".tif"),ExportType.TIFF,o);
+  var got=Folder(f.parent).getFiles(base+"*.tif");
+  if(!got.length) throw new Error("TIFF dosyası oluşmadı: "+path);
+  return got[0].fsName;
+ }
  if(fmt=="pdf"){o=new PDFSaveOptions();o.preserveEditability=true;}
  else if(fmt=="ai"){o=new IllustratorSaveOptions();o.embedICCProfile=true;}
  else{o=new EPSSaveOptions();o.embedAllFonts=true;o.embedLinkedFiles=true;o.saveMultipleArtboards=false;}
@@ -664,8 +679,15 @@ for(var n=0;n<DATA.edits.length;n++){
   throw new Error("Şablon analizden sonra değişmiş, yeniden analiz edin ("+e.label+")");
  setText(d.textFrames[e.i],e);
 }
-saveDoc(d,DATA.out,DATA.fmt);
-return ser({cur:d.fullName.fsName});
+var made=saveDoc(d,DATA.out,DATA.fmt);
+return ser({cur:d.fullName.fsName,made:made||null});
+"""
+
+AI_TO_TIFF = r"""
+var d=findDoc(DATA.src),mine=!d;
+if(mine) d=app.open(new File(DATA.src));
+try{var made=saveDoc(d,DATA.out,"tif");}finally{if(mine) d.close(SaveOptions.DONOTSAVECHANGES);}
+return ser({made:made});
 """
 
 AI_CLOSE = r"""
@@ -821,7 +843,8 @@ class AiTemplate:
         jobs = list(edits.values()) + [e for i, e in state["dirty"].items() if i not in edits]
         try:
             res = ill.call(AI_WRITE, tpl=str(self.path.resolve()), cur=state["cur"], out=str(target.resolve()),
-                           fmt=opts.get("fmt") or "eps", edits=jobs)
+                           fmt=opts.get("fmt") or "eps", edits=jobs, dpi=opts.get("tif_dpi") or 300,
+                           color=opts.get("tif_color") or "cmyk")
         except IllustratorError:
             # Belgenin hangi durumda kaldığı belli değil; kapatılsın, sonraki satır şablonu yeniden açsın.
             cur = state["cur"]
@@ -833,6 +856,7 @@ class AiTemplate:
                     pass
             raise
         state["cur"] = res["cur"]
+        take_made(res, target)
         state["dirty"] = {i: self._edit(self.nodes[i], self.nodes[i]["text"], self.nodes[i]["pt"], e["align"])
                           for i, e in edits.items()}
 
@@ -1240,6 +1264,37 @@ class PdfTemplate:
                 doc.update_stream(xref, data)
 
 
+def take_made(res, target):
+    """Illustrator'ın geçici adla yazdığı dosyayı (TIFF) asıl adına taşır."""
+    made = (res or {}).get("made")
+    if made and Path(made).resolve() != Path(target).resolve():
+        os.replace(made, target)
+
+
+def convert_tiff(folder, recursive=False, dpi=300, color="cmyk", skip_existing=True, progress=None):
+    """Klasördeki .eps/.ai dosyalarını Illustrator'da açıp yanlarına aynı adlı .tif olarak dışa aktarır.
+    Kaynak dosyalar kaydedilmez."""
+    folder = Path(folder)
+    found = folder.rglob("*") if recursive else folder.glob("*")
+    files = sorted((p for p in found if p.suffix.lower() in AI_EXTS and p.is_file()), key=lambda p: str(p).lower())
+    rep = {"done": [], "skipped": [], "errors": [], "total": len(files)}
+    for k, src in enumerate(files, 1):
+        if progress:
+            progress(k, len(files), src.name)
+        out = src.with_suffix(".tif")
+        if skip_existing and out.exists():
+            rep["skipped"].append(str(out))
+            continue
+        try:
+            res = illustrator().call(AI_TO_TIFF, src=str(src.resolve()), out=str(out.resolve()), dpi=dpi, color=color)
+            take_made(res, out)
+        except (IllustratorError, OSError) as e:
+            rep["errors"].append(f"{src.name}: {e}")
+            continue
+        rep["done"].append(str(out))
+    return rep
+
+
 MODES = {
     "svg": {"title": "SVG", "exts": (".svg",), "cls": Template},
     "eps": {"title": "EPS (Illustrator ile)", "exts": AI_EXTS, "cls": AiTemplate},
@@ -1364,7 +1419,7 @@ def row_label(row, active, idx):
     return f"satır {idx}"
 
 
-OUT_EXT_RE = re.compile(r"\.(svg|eps|pdf|ai)$", re.I)
+OUT_EXT_RE = re.compile(r"\.(svg|eps|pdf|ai|tiff?)$", re.I)
 
 
 def generate(opts, templates, fields, rows, dry=False, progress=None):
@@ -2172,6 +2227,8 @@ class Workspace(ttk.Frame):
         self.v_openafter = tk.BooleanVar(value=False)
         self.v_checkdir = tk.BooleanVar(value=True)
         self.v_fmt = tk.StringVar(value="eps")
+        self.v_tif_dpi = tk.StringVar(value="300")
+        self.v_tif_color = tk.StringVar(value=TIF_COLORS["cmyk"])
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=4, pady=4)
@@ -2191,6 +2248,7 @@ class Workspace(ttk.Frame):
                 "collision": self.v_coll.get(), "protect": self.v_protect.get(),
                 "save_report": self.v_savereport.get(), "open_after": self.v_openafter.get(),
                 "check_dir": self.v_checkdir.get(), "out_fmt": self.v_fmt.get(),
+                "tif_dpi": self.tif_dpi(), "tif_color": self.tif_color(),
                 "fields": self.fields, "rows": self.rows, "project_file": self.project_file}
 
     def load_project_dict(self, d):
@@ -2206,6 +2264,8 @@ class Workspace(ttk.Frame):
         self.v_openafter.set(bool(d.get("open_after")))
         self.v_checkdir.set(d.get("check_dir", True))
         self.v_fmt.set(d.get("out_fmt") if d.get("out_fmt") in OUT_FORMATS else "eps")
+        self.v_tif_dpi.set(str(d.get("tif_dpi") or 300))
+        self.v_tif_color.set(TIF_COLORS.get(d.get("tif_color"), TIF_COLORS["cmyk"]))
         self.fields = [dict(new_field(f.get("name", "")), **f) for f in d.get("fields", []) if f.get("name")]
         self.rows = [dict(r) for r in d.get("rows", []) if isinstance(r, dict)]
         for r in self.rows:  # eski projelerde sütunun adı "Şablon"du
@@ -2642,10 +2702,23 @@ class Workspace(ttk.Frame):
         if self.mode == "eps":
             o = ttk.LabelFrame(tab, text="Çıktı biçimi", padding=8)
             o.pack(fill="x", pady=(10, 0))
-            for k, v in OUT_FORMATS.items():
-                ttk.Radiobutton(o, text=v, variable=self.v_fmt, value=k).pack(side="left", padx=(0, 18))
-            ttk.Label(o, foreground="#555", text="EPS: fontlar gömülür.  PDF: Illustrator'da düzenlenebilir kalır."
-                      ).pack(side="left", padx=(12, 0))
+            o.columnconfigure(5, weight=1)
+            for j, (k, v) in enumerate(OUT_FORMATS.items()):
+                ttk.Radiobutton(o, text=v, variable=self.v_fmt, value=k, command=self._fmt_changed).grid(
+                    row=0, column=j, sticky="w", padx=(0, 18))
+            ttk.Label(o, foreground="#555", text="EPS: fontlar gömülür.  PDF: Illustrator'da düzenlenebilir kalır.  "
+                      "TIFF: Illustrator'dan dışa aktarılır (çalışma yüzeyi sınırında, LZW sıkıştırmalı)."
+                      ).grid(row=0, column=4, columnspan=2, sticky="w", padx=(12, 0))
+            tf = ttk.Frame(o)
+            tf.grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+            ttk.Label(tf, text="TIFF çözünürlüğü (dpi):").pack(side="left")
+            self.sp_dpi = ttk.Spinbox(tf, textvariable=self.v_tif_dpi, from_=72, to=2400, increment=50, width=7)
+            self.sp_dpi.pack(side="left", padx=(6, 18))
+            ttk.Label(tf, text="Renk modu:").pack(side="left")
+            self.cb_color = ttk.Combobox(tf, textvariable=self.v_tif_color, values=list(TIF_COLORS.values()),
+                                         state="readonly", width=8)
+            self.cb_color.pack(side="left", padx=6)
+            self._fmt_changed()
 
         c = ttk.LabelFrame(tab, text="Çıktı klasöründe aynı isimde dosya varsa", padding=8)
         c.pack(fill="x", pady=(10, 0))
@@ -2661,6 +2734,20 @@ class Workspace(ttk.Frame):
                         variable=self.v_savereport).pack(anchor="w")
         ttk.Checkbutton(s, text="Üretim bitince çıktı klasörünü aç", variable=self.v_openafter).pack(anchor="w")
         self._pattern_buttons()
+
+    def _fmt_changed(self):
+        on = self.v_fmt.get() == "tif"
+        self.sp_dpi.config(state="normal" if on else "disabled")
+        self.cb_color.config(state="readonly" if on else "disabled")
+
+    def tif_dpi(self):
+        try:
+            return min(2400, max(72, int(float(self.v_tif_dpi.get()))))
+        except ValueError:
+            return 300
+
+    def tif_color(self):
+        return next((k for k, v in TIF_COLORS.items() if v == self.v_tif_color.get()), "cmyk")
 
     def _pattern_buttons(self):
         if not hasattr(self, "pbar"):
@@ -2708,6 +2795,26 @@ class Workspace(ttk.Frame):
         ttk.Checkbutton(tab, variable=self.v_checkdir, text=(
             f"Elle kontrol gerekenleri ayrı klasöre koymayı sor ({CHECK_DIR}): fontta olmayan harf "
             f"(ör. Türkçe karakter) veya karakter sınırını aşan yazı")).pack(anchor="w", pady=(8, 0))
+        if self.mode == "eps":
+            self.v_conv_dir = tk.StringVar()
+            self.v_conv_rec = tk.BooleanVar(value=False)
+            self.v_conv_skip = tk.BooleanVar(value=True)
+            cv = ttk.LabelFrame(tab, text="Hazır EPS / AI dosyalarını TIFF'e çevir (Illustrator ile)", padding=8)
+            cv.pack(fill="x", pady=(10, 0))
+            cv.columnconfigure(1, weight=1)
+            ttk.Label(cv, text="Klasör:").grid(row=0, column=0, sticky="w")
+            ttk.Entry(cv, textvariable=self.v_conv_dir).grid(row=0, column=1, sticky="ew", padx=6)
+            ttk.Button(cv, text="Gözat…", command=lambda: self.browse(self.v_conv_dir)).grid(row=0, column=2)
+            ttk.Button(cv, text="Çıktı klasörü", command=lambda: self.v_conv_dir.set(self.v_out.get())).grid(
+                row=0, column=3, padx=(4, 0))
+            ttk.Button(cv, text="TIFF'e çevir", style="Big.TButton", command=self.convert_folder).grid(
+                row=0, column=4, rowspan=2, padx=(10, 0))
+            row = ttk.Frame(cv)
+            row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            ttk.Checkbutton(row, text="Alt klasörler de", variable=self.v_conv_rec).pack(side="left")
+            ttk.Checkbutton(row, text="TIFF'i zaten olanları atla", variable=self.v_conv_skip).pack(side="left", padx=12)
+            ttk.Label(row, foreground="#555", text="Her dosyanın yanına aynı adlı .tif yazılır; çözünürlük ve renk "
+                      "modu 3. sekmedeki TIFF ayarlarından alınır.").pack(side="left", padx=(6, 0))
         self.prog = ttk.Progressbar(tab, mode="determinate")
         self.prog.pack(fill="x", pady=8)
         f = ttk.Frame(tab)
@@ -2718,6 +2825,37 @@ class Workspace(ttk.Frame):
         sb.pack(side="right", fill="y")
         self.log.pack(fill="both", expand=True)
 
+    def convert_folder(self):
+        folder = self.v_conv_dir.get().strip() or self.v_out.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning(APP, "Çevrilecek EPS'lerin bulunduğu klasörü seçin.")
+            return
+        self.v_conv_dir.set(folder)
+        self.prog.config(value=0)
+
+        def progress(k, n, name):
+            self.prog.config(maximum=n, value=k)
+            self.status.config(text=f"TIFF'e çevriliyor ({k}/{n}): {name}")
+            self.update_idletasks()
+
+        dpi, color = self.tif_dpi(), self.tif_color()
+        rep = convert_tiff(folder, self.v_conv_rec.get(), dpi, color, self.v_conv_skip.get(), progress)
+        L = [f"TIFF DÖNÜŞTÜRME – {datetime.datetime.now():%d.%m.%Y %H:%M}", f"Klasör: {folder}",
+             f"Ayarlar: {dpi} dpi, {TIF_COLORS[color]}", "",
+             f"Bulunan EPS/AI: {rep['total']}   Çevrilen: {len(rep['done'])}   "
+             f"Atlanan (TIFF'i vardı): {len(rep['skipped'])}   Hata: {len(rep['errors'])}", ""]
+        if rep["errors"]:
+            L += ["HATALAR"] + ["  " + e for e in rep["errors"]] + [""]
+        if rep["done"]:
+            L += ["ÇEVRİLENLER"] + ["  " + Path(x).name for x in rep["done"]] + [""]
+        if rep["skipped"]:
+            L += ["ATLANANLAR"] + ["  " + Path(x).name for x in rep["skipped"]]
+        self.last_report = "\n".join(L)
+        self.set_log(self.last_report)
+        self.status.config(text=f"TIFF dönüştürme tamam: {len(rep['done'])} dosya, {len(rep['errors'])} hata")
+        if not rep["total"]:
+            messagebox.showinfo(APP, "Bu klasörde EPS ya da AI dosyası bulunamadı.")
+
     def set_log(self, text):
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
@@ -2727,7 +2865,8 @@ class Workspace(ttk.Frame):
     def options(self, out_dir=None):
         return {"out_dir": out_dir or self.v_out.get().strip(), "pattern": self.v_pattern.get(),
                 "use_name_col": self.v_usename.get(), "subfolder": self.v_sub.get(),
-                "collision": self.v_coll.get(), "protect": self.v_protect.get(), "fmt": self.v_fmt.get()}
+                "collision": self.v_coll.get(), "protect": self.v_protect.get(), "fmt": self.v_fmt.get(),
+                "tif_dpi": self.tif_dpi(), "tif_color": self.tif_color()}
 
     def preflight(self):
         self._close_editor()

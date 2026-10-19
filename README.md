@@ -9,7 +9,7 @@ Program üç sekmeden oluşur; her sekme bir şablon türüdür ve kendi klasör
 | Sekme | Şablon | Çıktı | Gereken |
 |---|---|---|---|
 | **SVG** | `.svg` | SVG | – |
-| **EPS (Illustrator ile)** | `.ai`, `.eps` | EPS (varsayılan), PDF ya da AI | Bilgisayarda kurulu Illustrator |
+| **EPS (Illustrator ile)** | `.ai`, `.eps` | EPS (varsayılan), PDF, AI ya da TIFF | Bilgisayarda kurulu Illustrator |
 | **PDF (Illustrator'süz)** | `.pdf` | PDF | Yazıdaki fontun bilgisayarda kurulu olması |
 
 ## Nasıl çalışır
@@ -36,6 +36,9 @@ Yazı katmanlarına Illustrator'da `NAME_M` gibi isim verip SVG olarak kaydedin.
 - **EPS** (varsayılan): fontlar gömülür.
 - **PDF**: Illustrator'da düzenlenebilir kalır.
 - **AI**
+- **TIFF**: Illustrator'ın kendi dışa aktarmasıyla, çalışma yüzeyi sınırında ve LZW sıkıştırmalı. Çözünürlük (dpi) ve renk modu (CMYK / RGB) aynı bölümden seçilir.
+
+Daha önce üretilmiş EPS'ler için **4. Üret** sekmesindeki **Hazır EPS / AI dosyalarını TIFF'e çevir** bölümü kullanılır: bir klasör (ör. export) seçilir, içindeki her `.eps` / `.ai` Illustrator'da açılıp yanına aynı adlı `.tif` olarak dışa aktarılır. İstenirse alt klasörler de taranır ve TIFF'i zaten olan dosyalar atlanır. Kaynak dosyalar kaydedilmez.
 
 Orijinal şablon hiçbir zaman kaydedilmez; üretimde şablon bir kez açılır, her satır "farklı kaydet" ile yazılır ve sonunda kaydetmeden kapatılır. Şablon o sırada Illustrator'da açıksa üretim durur ve kapatılması istenir. Analiz sonuçları dosya değişene kadar saklanır (`grafik-varyant-ai-onbellek.json`); bu yüzden program açılışında ve **Kontrol Et**'te Illustrator gerekmez.
 
